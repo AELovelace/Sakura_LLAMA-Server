@@ -112,6 +112,7 @@ class ServerSlot:
     start_button: QPushButton
     stop_button: QPushButton
     status_label: QLabel
+    proxy_status_label: QLabel
 
 
 class WorkerSignals(QObject):
@@ -742,7 +743,10 @@ class MainWindow(QMainWindow):
             "default_server": 0,
             "slots": [],
         }
-        self.ollama_proxy = OllamaCompatProxy(self._get_ollama_snapshot)
+        self.ollama_proxies: list[OllamaCompatProxy] = [
+            OllamaCompatProxy(lambda i=i: self._get_slot_snapshot(i))
+            for i in range(4)
+        ]
 
         self._build_ui()
         self._apply_theme()
@@ -751,6 +755,7 @@ class MainWindow(QMainWindow):
         for slot in self.server_slots:
             self._set_server_state(slot.index, False)
         self._refresh_ollama_snapshot()
+        self._update_proxy_port_labels()
 
     def _apply_theme(self) -> None:
         bg_path = (Path(__file__).resolve().parent / "assets" / "bg.jpg")
@@ -1109,9 +1114,11 @@ class MainWindow(QMainWindow):
         self.ollama_port_input.setValue(11434)
         ollama_proxy_layout.addWidget(QLabel("Host"), 0, 0)
         ollama_proxy_layout.addWidget(self.ollama_host_input, 0, 1)
-        ollama_proxy_layout.addWidget(QLabel("Port"), 0, 2)
+        ollama_proxy_layout.addWidget(QLabel("Base Port"), 0, 2)
         ollama_proxy_layout.addWidget(self.ollama_port_input, 0, 3)
         global_layout.addRow("Ollama API", self._wrap_layout(ollama_proxy_layout))
+        self.ollama_host_input.textChanged.connect(self._update_proxy_port_labels)
+        self.ollama_port_input.valueChanged.connect(self._update_proxy_port_labels)
 
         ollama_controls = QHBoxLayout()
         self.start_ollama_proxy_button = QPushButton("Start Ollama Proxy")
@@ -1222,6 +1229,9 @@ class MainWindow(QMainWindow):
         status_label = QLabel("Server is stopped.")
         form.addRow("Status", status_label)
 
+        proxy_status_label = QLabel("Proxy stopped.")
+        form.addRow("Proxy URL", proxy_status_label)
+
         process = QProcess(self)
         process.setProcessChannelMode(QProcess.MergedChannels)
         process.readyReadStandardOutput.connect(lambda i=index: self._append_server_output(i))
@@ -1246,6 +1256,7 @@ class MainWindow(QMainWindow):
                 start_button=start_button,
                 stop_button=stop_button,
                 status_label=status_label,
+                proxy_status_label=proxy_status_label,
             )
         )
 
@@ -1817,6 +1828,16 @@ class MainWindow(QMainWindow):
         with self._snapshot_lock:
             return deepcopy(self._ollama_snapshot)
 
+    def _get_slot_snapshot(self, slot_index: int) -> dict[str, Any]:
+        with self._snapshot_lock:
+            full = deepcopy(self._ollama_snapshot)
+        slots = full.get("slots", [])
+        slot_data = slots[slot_index] if slot_index < len(slots) else {}
+        return {
+            "default_server": 0,
+            "slots": [slot_data] if slot_data else [],
+        }
+
     def _set_ollama_proxy_state(self, running: bool, status_message: str) -> None:
         self.start_ollama_proxy_button.setEnabled(not running)
         self.stop_ollama_proxy_button.setEnabled(running)
@@ -1824,28 +1845,52 @@ class MainWindow(QMainWindow):
 
     def start_ollama_proxy(self) -> None:
         host = self.ollama_host_input.text().strip() or "127.0.0.1"
-        port = self.ollama_port_input.value()
+        base_port = self.ollama_port_input.value()
         self._refresh_ollama_snapshot()
         self._save_config()
 
-        try:
-            self.ollama_proxy.start(host, port)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Ollama Proxy Failed", str(exc))
+        started = 0
+        errors: list[str] = []
+        for i, proxy in enumerate(self.ollama_proxies):
+            port = base_port + i
+            try:
+                proxy.start(host, port)
+                started += 1
+                if i < len(self.server_slots):
+                    self.server_slots[i].proxy_status_label.setText(f"http://{host}:{port}")
+                self.log_output.appendPlainText(f"[OLLAMA] S{i + 1} proxy at http://{host}:{port}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"S{i + 1}: {exc}")
+
+        if started == 0:
+            QMessageBox.critical(self, "Ollama Proxy Failed", "\n".join(errors) or "All proxies failed to start.")
             self._set_ollama_proxy_state(False, "Ollama API proxy failed to start.")
             return
 
-        self._set_ollama_proxy_state(True, f"Running at http://{host}:{port}")
-        self.log_output.appendPlainText(f"[OLLAMA] proxy started at http://{host}:{port}")
+        status = f"Running — S1={base_port}, S2={base_port + 1}, S3={base_port + 2}, S4={base_port + 3}"
+        if errors:
+            status += f"  ({len(errors)} failed: {'; '.join(errors)})"
+        self._set_ollama_proxy_state(True, status)
 
     def stop_ollama_proxy(self) -> None:
-        self.ollama_proxy.stop()
+        for i, proxy in enumerate(self.ollama_proxies):
+            proxy.stop()
         self._set_ollama_proxy_state(False, "Ollama API proxy is stopped.")
-        self.log_output.appendPlainText("[OLLAMA] proxy stopped")
+        self.log_output.appendPlainText("[OLLAMA] all proxies stopped")
+        self._update_proxy_port_labels()
 
     def test_ollama_proxy(self) -> None:
         host = self.ollama_host_input.text().strip() or "127.0.0.1"
-        port = self.ollama_port_input.value()
+        base_port = self.ollama_port_input.value()
+
+        running_index = next(
+            (i for i, proxy in enumerate(self.ollama_proxies) if proxy.is_running()), None
+        )
+        if running_index is None:
+            self.ollama_proxy_test_status.setText("No proxy is running.")
+            return
+
+        port = base_port + running_index
         base_url = f"http://{host}:{port}"
 
         self.test_ollama_proxy_button.setEnabled(False)
@@ -1877,6 +1922,18 @@ class MainWindow(QMainWindow):
     def _ollama_proxy_test_failed(self, message: str) -> None:
         self.test_ollama_proxy_button.setEnabled(True)
         self.ollama_proxy_test_status.setText(f"Failed: {message}")
+
+    def _update_proxy_port_labels(self) -> None:
+        if not hasattr(self, "server_slots") or not hasattr(self, "ollama_proxies"):
+            return
+        host = self.ollama_host_input.text().strip() or "127.0.0.1"
+        base_port = self.ollama_port_input.value()
+        for i, slot in enumerate(self.server_slots):
+            proxy = self.ollama_proxies[i] if i < len(self.ollama_proxies) else None
+            if proxy and proxy.is_running():
+                slot.proxy_status_label.setText(f"http://{host}:{base_port + i}")
+            else:
+                slot.proxy_status_label.setText(f"Proxy stopped (port {base_port + i})")
 
     def _auto_detect_llama_server(self, backend: str) -> str:
         backend_key = backend.strip().lower()
