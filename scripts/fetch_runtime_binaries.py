@@ -55,7 +55,18 @@ def detect_existing(backend: str, workspace: Path) -> Path | None:
     for candidate in candidates_for_backend(backend, workspace):
         if candidate.exists() and candidate.is_file():
             return candidate.resolve()
-    return None
+
+    folder = workspace / BACKEND_FOLDERS[backend]
+    if not folder.exists():
+        return None
+
+    target = "llama-server.exe" if os.name == "nt" else "llama-server"
+    matches = [path for path in folder.rglob(target) if path.is_file()]
+    if not matches:
+        return None
+
+    newest = max(matches, key=lambda path: path.stat().st_mtime)
+    return newest.resolve()
 
 
 def load_runtime_urls(workspace: Path) -> dict[str, str]:
@@ -190,6 +201,24 @@ def download_to_temp(url: str) -> Path:
     return tmp_path
 
 
+def _strip_archive_suffixes(filename: str) -> str:
+    value = filename
+    for suffix in (".tar.gz", ".tgz", ".zip", ".tar", ".gz"):
+        if value.lower().endswith(suffix):
+            value = value[: -len(suffix)]
+            break
+    return value
+
+
+def version_folder_name_from_url(url: str, backend: str) -> str:
+    name = Path(url.split("?", 1)[0]).name
+    stem = _strip_archive_suffixes(name)
+    if not stem:
+        stem = f"{backend}-runtime"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._")
+    return safe or f"{backend}-runtime"
+
+
 def extract_or_copy(archive_path: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     lower_name = archive_path.name.lower()
@@ -248,7 +277,8 @@ def main() -> int:
         )
         return 2
 
-    destination = (workspace / BACKEND_FOLDERS[backend]).resolve()
+    backend_root = (workspace / BACKEND_FOLDERS[backend]).resolve()
+    destination = backend_root / version_folder_name_from_url(url, backend)
     archive_path: Path | None = None
 
     try:

@@ -1919,6 +1919,20 @@ class MainWindow(QMainWindow):
             if candidate.exists():
                 return str(candidate.resolve())
 
+        backend_roots: dict[str, Path] = {
+            "cuda": Path("llama.cpp"),
+            "hip": Path("hip-llama"),
+            "vulkan": Path("vulkan-llama"),
+            "cpu": Path("cpu-llama"),
+        }
+        backend_root = backend_roots.get(backend_key)
+        if backend_root and backend_root.exists():
+            target_name = "llama-server.exe" if os.name == "nt" else "llama-server"
+            matches = [path for path in backend_root.rglob(target_name) if path.is_file()]
+            if matches:
+                newest = max(matches, key=lambda path: path.stat().st_mtime)
+                return str(newest.resolve())
+
         return ""
 
     def _selected_devices(self, slot: ServerSlot) -> list[GPUDevice]:

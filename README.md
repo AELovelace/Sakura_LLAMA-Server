@@ -90,6 +90,8 @@ Device assignment behavior:
 Runtime fetch behavior:
 
 - If a selected backend runtime is missing locally, the app runs `scripts/fetch_runtime_binaries.py` automatically.
+- Downloaded runtime archives are extracted into versioned subfolders under each backend folder (for example `hip-llama/llama-b8795-bin-win-hip-radeon-x64/`).
+- Auto-detection prefers the newest `llama-server` binary found for that backend.
 - For Windows, release asset selection prefers these targets from latest ggml release:
 	- CUDA: `win-cuda-12.x`
 	- Vulkan: `win-vulkan-x64`
