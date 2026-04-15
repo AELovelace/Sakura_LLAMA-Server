@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 import requests
 from huggingface_hub import HfApi, hf_hub_url
 from PySide6.QtCore import QProcess, QProcessEnvironment, QRunnable, QThreadPool, Qt, QObject, Signal
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
@@ -41,6 +43,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QSystemTrayIcon,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -122,6 +125,7 @@ class ServerSlot:
     cache_type_k_input: QComboBox
     cache_type_v_input: QComboBox
     flash_attn_checkbox: QCheckBox
+    auto_start_checkbox: QCheckBox
     start_button: QPushButton
     stop_button: QPushButton
     status_label: QLabel
@@ -829,6 +833,13 @@ class MainWindow(QMainWindow):
         self._refresh_ollama_snapshot()
         self._update_proxy_port_labels()
 
+        # ---- System tray ----
+        self._build_tray_icon()
+
+        # ---- Auto-start (deferred until event loop is running) ----
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(500, self._auto_start_servers)
+
     def _apply_theme(self) -> None:
         bg_path = (Path(__file__).resolve().parent / "assets" / "bg.jpg")
         bg_uri = bg_path.as_uri().replace("\"", "\\\"") if bg_path.exists() else ""
@@ -1290,7 +1301,12 @@ class MainWindow(QMainWindow):
         kv_row.addWidget(cache_type_v_input)
         form.addRow("KV Cache Type", self._wrap_layout(kv_row))
 
-        flash_attn_checkbox = QCheckBox("Enable (recommended with quantized KV cache)")
+        flash_attn_checkbox = QCheckBox("Enable (requires Pascal / CC 6.0+ GPU)")
+        flash_attn_checkbox.setToolTip(
+            "Flash Attention reduces memory during long-context inference.\n"
+            "Requires NVIDIA Pascal (GTX 10xx / CC 6.0) or newer.\n"
+            "Maxwell GPUs (GTX Titan X, 980, etc.) do NOT support this — the server will crash."
+        )
         form.addRow("Flash Attention", flash_attn_checkbox)
 
         network_layout = QGridLayout()
@@ -1313,6 +1329,9 @@ class MainWindow(QMainWindow):
         extra_args_input = QLineEdit()
         extra_args_input.setPlaceholderText("Optional extra args, e.g. --n-gpu-layers 999")
         form.addRow("Extra Args", extra_args_input)
+
+        auto_start_checkbox = QCheckBox("Launch this server when the app starts")
+        form.addRow("Auto-Start", auto_start_checkbox)
 
         controls_row = QHBoxLayout()
         start_button = QPushButton("Start")
@@ -1354,6 +1373,7 @@ class MainWindow(QMainWindow):
                 cache_type_k_input=cache_type_k_input,
                 cache_type_v_input=cache_type_v_input,
                 flash_attn_checkbox=flash_attn_checkbox,
+                auto_start_checkbox=auto_start_checkbox,
                 start_button=start_button,
                 stop_button=stop_button,
                 status_label=status_label,
@@ -1612,6 +1632,7 @@ class MainWindow(QMainWindow):
             if v_idx >= 0:
                 slot.cache_type_v_input.setCurrentIndex(v_idx)
             slot.flash_attn_checkbox.setChecked(bool(server_data.get("flash_attn", False)))
+            slot.auto_start_checkbox.setChecked(bool(server_data.get("auto_start", False)))
 
             selected_device_keys = server_data.get("device_keys")
             if isinstance(selected_device_keys, list):
@@ -1647,6 +1668,7 @@ class MainWindow(QMainWindow):
                     "cache_type_k": slot.cache_type_k_input.currentText(),
                     "cache_type_v": slot.cache_type_v_input.currentText(),
                     "flash_attn": slot.flash_attn_checkbox.isChecked(),
+                    "auto_start": slot.auto_start_checkbox.isChecked(),
                     "device_keys": selected_keys,
                     "split_mode": slot.split_mode_input.currentText(),
                 }
@@ -1957,6 +1979,29 @@ class MainWindow(QMainWindow):
         self.stop_ollama_proxy_button.setEnabled(running)
         self.ollama_proxy_status.setText(status_message)
 
+    # ------------------------------------------------------------------ #
+    #  Auto-start on app launch                                           #
+    # ------------------------------------------------------------------ #
+    def _auto_start_servers(self) -> None:
+        """Start any slots marked 'Auto-Start' and the proxy if needed."""
+        started_any = False
+        for slot in self.server_slots:
+            if slot.auto_start_checkbox.isChecked():
+                model_path = slot.model_path_input.text().strip()
+                if model_path and Path(model_path).exists():
+                    self.log_output.appendPlainText(
+                        f"[AUTO] Starting Server {slot.index + 1} (auto-start enabled)"
+                    )
+                    self.start_server(slot.index)
+                    started_any = True
+                else:
+                    self.log_output.appendPlainText(
+                        f"[AUTO] Skipped Server {slot.index + 1}: model file not found."
+                    )
+        if started_any:
+            self.log_output.appendPlainText("[AUTO] Starting Ollama proxy …")
+            self.start_ollama_proxy()
+
     def start_ollama_proxy(self) -> None:
         host = self.ollama_host_input.text().strip() or "127.0.0.1"
         base_port = self.ollama_port_input.value()
@@ -2240,6 +2285,8 @@ class MainWindow(QMainWindow):
         ]
 
         gpu_ids = [device.env_id for device in selected_devices if device.backend == backend and device.env_id]
+        if gpu_ids:
+            arguments.extend(["--n-gpu-layers", "999"])
         if len(gpu_ids) > 1 and slot.split_mode_input.currentText() == "pooled":
             arguments.extend(["--main-gpu", "0", "--tensor-split", ",".join(["1"] * len(gpu_ids))])
 
@@ -2375,19 +2422,77 @@ class MainWindow(QMainWindow):
             size /= 1024
         return "0 B"
 
+    # ------------------------------------------------------------------ #
+    #  System tray + close-to-tray                                        #
+    # ------------------------------------------------------------------ #
+    def _build_tray_icon(self) -> None:
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setToolTip(APP_NAME)
+
+        # Use a simple built-in icon; works on all platforms.
+        icon = self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon)
+        self.tray_icon.setIcon(icon)
+        self.setWindowIcon(icon)
+
+        tray_menu = QMenu(self)
+        show_action = QAction("Show / Restore", self)
+        show_action.triggered.connect(self._tray_restore)
+        tray_menu.addAction(show_action)
+
+        tray_menu.addSeparator()
+        quit_action = QAction("Quit (stop all servers)", self)
+        quit_action.triggered.connect(self._tray_quit)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._tray_activated)
+        self.tray_icon.show()
+
+    def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:  # single-click
+            self._tray_restore()
+
+    def _tray_restore(self) -> None:
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def _tray_quit(self) -> None:
+        """Actually quit — kill servers, proxy, and exit."""
+        self._really_quit = True
+        self.close()
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        self.stop_ollama_proxy()
-        self._save_config()
-        for slot in self.server_slots:
-            if slot.process.state() != QProcess.NotRunning:
-                slot.process.kill()
-                slot.process.waitForFinished(2000)
-        super().closeEvent(event)
+        # If the user chose "Quit" from the tray, or no servers are running,
+        # do a real exit.  Otherwise minimize to tray.
+        any_running = any(
+            slot.process.state() != QProcess.NotRunning for slot in self.server_slots
+        )
+        if getattr(self, "_really_quit", False) or not any_running:
+            self.tray_icon.hide()
+            self.stop_ollama_proxy()
+            self._save_config()
+            for slot in self.server_slots:
+                if slot.process.state() != QProcess.NotRunning:
+                    slot.process.kill()
+                    slot.process.waitForFinished(2000)
+            super().closeEvent(event)
+        else:
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                APP_NAME,
+                "Servers still running — minimized to tray.\n"
+                "Right-click the tray icon to quit.",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000,
+            )
 
 
 def main() -> int:
     os.makedirs(MODELS_DIR, exist_ok=True)
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)  # keep alive when minimized to tray
     window = MainWindow()
     window.show()
     return app.exec()
