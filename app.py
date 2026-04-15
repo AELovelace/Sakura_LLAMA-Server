@@ -56,6 +56,16 @@ MODELS_DIR = Path("models")
 LLAMA_CPP_RELEASES_URL = "https://github.com/ggml-org/llama.cpp/releases"
 
 
+def normalize_connect_host(host: str) -> str:
+    value = host.strip()
+    if not value:
+        return "127.0.0.1"
+    lowered = value.lower()
+    if lowered in {"0.0.0.0", "::", "[::]"}:
+        return "127.0.0.1"
+    return value
+
+
 @dataclass
 class ModelSearchResult:
     repo_id: str
@@ -545,7 +555,8 @@ class OllamaCompatProxy:
         temperature: float,
         max_tokens: int,
     ) -> str:
-        base_url = f"http://{slot.get('host', '127.0.0.1')}:{int(slot.get('port', 8080))}"
+        upstream_host = normalize_connect_host(str(slot.get("host", "127.0.0.1") or "127.0.0.1"))
+        base_url = f"http://{upstream_host}:{int(slot.get('port', 8080))}"
         response = requests.post(
             f"{base_url.rstrip('/')}/v1/chat/completions",
             json={
@@ -567,7 +578,8 @@ class OllamaCompatProxy:
         temperature: float,
         max_tokens: int,
     ) -> str:
-        base_url = f"http://{slot.get('host', '127.0.0.1')}:{int(slot.get('port', 8080))}"
+        upstream_host = normalize_connect_host(str(slot.get("host", "127.0.0.1") or "127.0.0.1"))
+        base_url = f"http://{upstream_host}:{int(slot.get('port', 8080))}"
         response = requests.post(
             f"{base_url.rstrip('/')}/v1/completions",
             json={
@@ -1796,7 +1808,7 @@ class MainWindow(QMainWindow):
 
     def _server_base_url(self, index: int) -> str:
         slot = self.server_slots[index]
-        host = slot.host_input.text().strip() or "127.0.0.1"
+        host = normalize_connect_host(slot.host_input.text().strip() or "127.0.0.1")
         return f"http://{host}:{slot.port_input.value()}"
 
     def _refresh_ollama_snapshot(self) -> None:
@@ -1809,7 +1821,7 @@ class MainWindow(QMainWindow):
                 {
                     "index": idx,
                     "ollama_model": slot.ollama_model_input.text().strip(),
-                    "host": slot.host_input.text().strip() or "127.0.0.1",
+                    "host": normalize_connect_host(slot.host_input.text().strip() or "127.0.0.1"),
                     "port": slot.port_input.value(),
                     "model_path": slot.model_path_input.text().strip(),
                     "backend": backend or "",
@@ -1880,7 +1892,7 @@ class MainWindow(QMainWindow):
         self._update_proxy_port_labels()
 
     def test_ollama_proxy(self) -> None:
-        host = self.ollama_host_input.text().strip() or "127.0.0.1"
+        host = normalize_connect_host(self.ollama_host_input.text().strip() or "127.0.0.1")
         base_port = self.ollama_port_input.value()
 
         running_index = next(
