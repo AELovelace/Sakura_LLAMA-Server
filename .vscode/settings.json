@@ -1,0 +1,15 @@
+{
+  "terminal.integrated.profiles.windows": {
+    "PowerShell (Auto Activate Venv)": {
+      "source": "PowerShell",
+      "args": [
+        "-NoExit",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "& '.\\.venv\\Scripts\\Activate.ps1'"
+      ]
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "PowerShell (Auto Activate Venv)"
+}
