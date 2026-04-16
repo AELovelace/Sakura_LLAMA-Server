@@ -9,3 +9,5 @@ cuda-llama/
 hip-llama/
 vulkan-llama/
 llama.cpp/
+lib/
+lhm_netfx.zip

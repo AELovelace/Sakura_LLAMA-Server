@@ -9,18 +9,21 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import URLError
 from urllib.parse import urlparse
+from urllib.request import urlretrieve
 
 import requests
 from huggingface_hub import HfApi, hf_hub_url, snapshot_download
 from PySide6.QtCore import QProcess, QProcessEnvironment, QRunnable, QThreadPool, Qt, QObject, QTimer, Signal
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QAction, QColor, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -64,12 +67,31 @@ try:
 except Exception:  # noqa: BLE001
     pynvml = None
 
+try:
+    import clr  # type: ignore
+except Exception:  # noqa: BLE001
+    clr = None
+
 
 APP_NAME = "DoLLAMACPP Frontend"
 CONFIG_PATH = Path("frontend_config.json")
 MODELS_DIR = Path("models")
 LLAMA_CPP_RELEASES_URL = "https://github.com/ggml-org/llama.cpp/releases"
 OLLAMA_BLOBS_DIR = Path(os.environ.get("OLLAMA_MODELS", "")) / "blobs" if os.environ.get("OLLAMA_MODELS") else Path.home() / ".ollama" / "models" / "blobs"
+PROJECT_ROOT = Path(__file__).resolve().parent
+SAKURA_LIB_DIR = PROJECT_ROOT / "lib"
+SAKURA_LHM_VERSION = "0.9.6"
+SAKURA_LHM_ARCHIVE_NAME = "lhm_netfx.zip"
+SAKURA_LHM_ARCHIVE_URLS = [
+    (
+        "https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/download/"
+        f"v{SAKURA_LHM_VERSION}/LibreHardwareMonitor-net472.zip"
+    ),
+    (
+        "https://sourceforge.net/projects/librehardwaremonitor.mirror/files/"
+        f"v{SAKURA_LHM_VERSION}/LibreHardwareMonitor-net472.zip/download"
+    ),
+]
 
 
 def normalize_connect_host(host: str) -> str:
@@ -127,9 +149,101 @@ class SakuraGPUStats:
     vram_total_mib: int
     vram_used_mib: int
     vram_percent: float
-    util_percent: float | None
     core_clock_mhz: int | None
+    util_percent: float | None
     power_watts: float | None
+    temperature_c: float | None = None
+    shared_total_mib: int = 0
+    shared_used_mib: int = 0
+    shared_percent: float = 0.0
+
+
+@dataclass
+class SakuraSystemStats:
+    cpu_percent: float
+    cpu_power_watts: float | None
+    cpu_temp_c: float | None
+    ram_total_gib: float
+    ram_used_gib: float
+    ram_percent: float
+    ram_power_watts: float | None
+    ram_temp_c: float | None
+
+
+def ensure_sakura_lhm_lib_available() -> tuple[Path | None, str | None]:
+    target_dll = SAKURA_LIB_DIR / "LibreHardwareMonitorLib.dll"
+    if target_dll.exists():
+        return target_dll.resolve(), None
+
+    archive_path = PROJECT_ROOT / SAKURA_LHM_ARCHIVE_NAME
+
+    try:
+        SAKURA_LIB_DIR.mkdir(parents=True, exist_ok=True)
+
+        downloaded = False
+        if not archive_path.exists():
+            last_error: Exception | None = None
+            for archive_url in SAKURA_LHM_ARCHIVE_URLS:
+                try:
+                    urlretrieve(archive_url, archive_path)
+                    downloaded = True
+                    break
+                except (URLError, OSError) as exc:
+                    last_error = exc
+            if not downloaded:
+                raise last_error or OSError("download failed")
+
+        extracted_any = False
+        with zipfile.ZipFile(archive_path) as archive:
+            for member in archive.infolist():
+                member_path = Path(member.filename)
+                if member.is_dir():
+                    continue
+                if len(member_path.parts) != 1:
+                    continue
+                if member_path.suffix.lower() != ".dll":
+                    continue
+
+                destination = SAKURA_LIB_DIR / member_path.name
+                with archive.open(member) as src, destination.open("wb") as dst:
+                    dst.write(src.read())
+                extracted_any = True
+
+        if target_dll.exists():
+            source_label = "download" if downloaded else "cache"
+            return target_dll.resolve(), f"LibreHardwareMonitor: restored {SAKURA_LHM_VERSION} from {source_label}"
+
+        if extracted_any:
+            return None, "LibreHardwareMonitor: archive extracted but LibreHardwareMonitorLib.dll was not found"
+        return None, "LibreHardwareMonitor: archive did not contain any root-level DLLs"
+    except (URLError, OSError, zipfile.BadZipFile) as exc:
+        return None, f"LibreHardwareMonitor: auto-fetch failed ({exc})"
+
+
+def _find_sakura_lhm_dll() -> Path | None:
+    candidates: list[Path] = []
+
+    env_path = os.environ.get("LHM_DLL_PATH", "").strip()
+    if env_path:
+        candidates.append(Path(env_path))
+
+    candidates.extend(
+        [
+            PROJECT_ROOT / "LibreHardwareMonitorLib.dll",
+            SAKURA_LIB_DIR / "LibreHardwareMonitorLib.dll",
+            Path(os.environ.get("ProgramFiles", "")) / "LibreHardwareMonitor" / "LibreHardwareMonitorLib.dll",
+            Path(os.environ.get("ProgramFiles(x86)", "")) / "LibreHardwareMonitor" / "LibreHardwareMonitorLib.dll",
+            Path(os.environ.get("LOCALAPPDATA", ""))
+            / "Programs"
+            / "LibreHardwareMonitor"
+            / "LibreHardwareMonitorLib.dll",
+        ]
+    )
+
+    for candidate in candidates:
+        if str(candidate).strip() and candidate.exists():
+            return candidate.resolve()
+    return None
 
 
 class SakuraNvidiaMonitor:
@@ -182,15 +296,24 @@ class SakuraNvidiaMonitor:
                 except Exception:  # noqa: BLE001
                     power_watts = None
 
+                temperature_c: float | None = None
+                try:
+                    temperature_c = float(
+                        pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                    )
+                except Exception:  # noqa: BLE001
+                    temperature_c = None
+
                 stats.append(
                     SakuraGPUStats(
                         name=str(name),
                         vram_total_mib=vram_total_mib,
                         vram_used_mib=vram_used_mib,
                         vram_percent=vram_percent,
-                        util_percent=util_percent,
                         core_clock_mhz=core_clock_mhz,
+                        util_percent=util_percent,
                         power_watts=power_watts,
+                        temperature_c=temperature_c,
                     )
                 )
             except Exception:  # noqa: BLE001
@@ -207,18 +330,273 @@ class SakuraNvidiaMonitor:
             pass
 
 
+class SakuraLibreHardwareMonitorBridge:
+    def __init__(self) -> None:
+        self.available = False
+        self.status = "LibreHardwareMonitor: unavailable"
+        self._computer: Any = None
+        self._sensor_type_power = None
+        self._sensor_type_load = None
+        self._sensor_type_clock = None
+        self._sensor_type_data = None
+        self._sensor_type_small_data = None
+        self._sensor_type_temperature = None
+
+        if os.name != "nt":
+            self.status = "LibreHardwareMonitor: Windows only"
+            return
+        if clr is None:
+            if sys.version_info >= (3, 14):
+                self.status = "LibreHardwareMonitor: pythonnet unavailable on Python 3.14+"
+            else:
+                self.status = "LibreHardwareMonitor: pythonnet not installed"
+            return
+
+        dll_path = _find_sakura_lhm_dll()
+        auto_dll: Path | None = None
+        auto_status: str | None = None
+        if dll_path is None:
+            auto_dll, auto_status = ensure_sakura_lhm_lib_available()
+            dll_path = auto_dll or _find_sakura_lhm_dll()
+        if dll_path is None:
+            self.status = auto_status or "LibreHardwareMonitor: DLL not found"
+            return
+
+        try:
+            dll_dir = dll_path.parent
+            for dependency in sorted(dll_dir.glob("*.dll")):
+                if dependency.name.lower() == "librehardwaremonitorlib.dll":
+                    continue
+                try:
+                    clr.AddReference(str(dependency))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            clr.AddReference(str(dll_path))
+            from LibreHardwareMonitor.Hardware import Computer, SensorType  # type: ignore
+
+            self._sensor_type_power = SensorType.Power
+            self._sensor_type_load = SensorType.Load
+            self._sensor_type_clock = SensorType.Clock
+            self._sensor_type_data = SensorType.Data
+            self._sensor_type_small_data = SensorType.SmallData
+            self._sensor_type_temperature = SensorType.Temperature
+
+            computer = Computer()
+            computer.IsCpuEnabled = True
+            computer.IsGpuEnabled = True
+            computer.IsMemoryEnabled = True
+            computer.IsMotherboardEnabled = True
+            computer.IsControllerEnabled = True
+            computer.Open()
+
+            self._computer = computer
+            self.available = True
+            if auto_status and auto_dll and dll_path.resolve() == auto_dll.resolve():
+                self.status = f"{auto_status}; connected ({dll_path.name})"
+            else:
+                self.status = f"LibreHardwareMonitor: connected ({dll_path.name})"
+        except Exception as exc:  # noqa: BLE001
+            self.status = f"LibreHardwareMonitor: load failed ({exc})"
+
+    def _iter_hardware(self):
+        if self._computer is None:
+            return
+
+        queue = [item for item in self._computer.Hardware]
+        while queue:
+            hw = queue.pop(0)
+            yield hw
+            for sub in hw.SubHardware:
+                queue.append(sub)
+
+    def collect_cpu_ram_telemetry(self) -> tuple[float | None, float | None, float | None, float | None]:
+        if not self.available:
+            return None, None, None, None
+
+        cpu_candidates: list[float] = []
+        ram_candidates: list[float] = []
+        cpu_temp_candidates: list[float] = []
+        ram_temp_candidates: list[float] = []
+
+        try:
+            for hw in self._iter_hardware() or []:
+                hw.Update()
+                hw_type = str(hw.HardwareType).lower()
+
+                for sensor in hw.Sensors:
+                    if sensor.Value is None:
+                        continue
+
+                    sensor_name = str(sensor.Name).lower()
+                    value = float(sensor.Value)
+
+                    if sensor.SensorType == self._sensor_type_power:
+                        if "cpu" in hw_type:
+                            if any(keyword in sensor_name for keyword in ("package", "total", "cpu", "ppt")):
+                                cpu_candidates.append(value)
+                        elif "memory" in hw_type or "ram" in hw_type:
+                            ram_candidates.append(value)
+
+                        if any(keyword in sensor_name for keyword in ("dram", "dimm", "ram", "memory")):
+                            ram_candidates.append(value)
+
+                    elif sensor.SensorType == self._sensor_type_temperature:
+                        if "cpu" in hw_type:
+                            if any(keyword in sensor_name for keyword in ("package", "cpu", "die", "tdie", "tctl")):
+                                cpu_temp_candidates.append(value)
+                        elif "memory" in hw_type or "ram" in hw_type:
+                            ram_temp_candidates.append(value)
+
+                        if any(keyword in sensor_name for keyword in ("dram", "dimm", "ram", "memory")):
+                            ram_temp_candidates.append(value)
+        except Exception:  # noqa: BLE001
+            return None, None, None, None
+
+        cpu_power = max(cpu_candidates) if cpu_candidates else None
+        ram_power = max(ram_candidates) if ram_candidates else None
+        cpu_temp = max(cpu_temp_candidates) if cpu_temp_candidates else None
+        ram_temp = max(ram_temp_candidates) if ram_temp_candidates else None
+        return cpu_power, ram_power, cpu_temp, ram_temp
+
+    @staticmethod
+    def _data_value_to_mib(value: float, sensor_type: Any) -> int:
+        if str(sensor_type) == "SmallData":
+            return int(round(value))
+        if value <= 512:
+            return int(round(value * 1024))
+        return int(round(value))
+
+    def collect_gpu_stats(self) -> list[SakuraGPUStats]:
+        if not self.available:
+            return []
+
+        stats: list[SakuraGPUStats] = []
+        try:
+            for hw in self._iter_hardware() or []:
+                hw.Update()
+                hw_type = str(hw.HardwareType).lower()
+                if "gpu" not in hw_type:
+                    continue
+
+                util_percent: float | None = None
+                core_clock_mhz: int | None = None
+                power_watts: float | None = None
+                temperature_c: float | None = None
+                mem_used_mib: int | None = None
+                mem_total_mib: int | None = None
+                mem_free_mib: int | None = None
+                dedicated_used_mib: int | None = None
+                dedicated_total_mib: int | None = None
+                dedicated_free_mib: int | None = None
+                shared_used_mib: int | None = None
+                shared_total_mib: int | None = None
+                shared_free_mib: int | None = None
+
+                for sensor in hw.Sensors:
+                    if sensor.Value is None:
+                        continue
+
+                    sensor_name = str(sensor.Name).lower()
+                    value = float(sensor.Value)
+                    sensor_type = sensor.SensorType
+
+                    if sensor_type == self._sensor_type_load:
+                        if "core" in sensor_name or "gpu" in sensor_name:
+                            util_percent = value if util_percent is None else max(util_percent, value)
+
+                    elif sensor_type == self._sensor_type_clock:
+                        if "core" in sensor_name or "graphics" in sensor_name:
+                            mhz = int(round(value))
+                            core_clock_mhz = mhz if core_clock_mhz is None else max(core_clock_mhz, mhz)
+
+                    elif sensor_type == self._sensor_type_power:
+                        if "total" in sensor_name or "package" in sensor_name or "gpu" in sensor_name:
+                            power_watts = value if power_watts is None else max(power_watts, value)
+
+                    elif sensor_type == self._sensor_type_temperature:
+                        if "core" in sensor_name or "gpu" in sensor_name or "hotspot" in sensor_name:
+                            temperature_c = value if temperature_c is None else max(temperature_c, value)
+
+                    elif sensor_type in (self._sensor_type_data, self._sensor_type_small_data):
+                        if "d3d dedicated memory used" in sensor_name:
+                            dedicated_used_mib = self._data_value_to_mib(value, sensor_type)
+                        elif "d3d dedicated memory total" in sensor_name:
+                            dedicated_total_mib = self._data_value_to_mib(value, sensor_type)
+                        elif "d3d dedicated memory free" in sensor_name:
+                            dedicated_free_mib = self._data_value_to_mib(value, sensor_type)
+                        elif "d3d shared memory used" in sensor_name:
+                            shared_used_mib = self._data_value_to_mib(value, sensor_type)
+                        elif "d3d shared memory total" in sensor_name:
+                            shared_total_mib = self._data_value_to_mib(value, sensor_type)
+                        elif "d3d shared memory free" in sensor_name:
+                            shared_free_mib = self._data_value_to_mib(value, sensor_type)
+                        elif "memory used" in sensor_name:
+                            mem_used_mib = self._data_value_to_mib(value, sensor_type)
+                        elif "memory total" in sensor_name:
+                            mem_total_mib = self._data_value_to_mib(value, sensor_type)
+                        elif "memory free" in sensor_name:
+                            mem_free_mib = self._data_value_to_mib(value, sensor_type)
+
+                if dedicated_total_mib is None and dedicated_used_mib is not None and dedicated_free_mib is not None:
+                    dedicated_total_mib = dedicated_used_mib + dedicated_free_mib
+                if shared_total_mib is None and shared_used_mib is not None and shared_free_mib is not None:
+                    shared_total_mib = shared_used_mib + shared_free_mib
+                if mem_total_mib is None and mem_used_mib is not None and mem_free_mib is not None:
+                    mem_total_mib = mem_used_mib + mem_free_mib
+
+                vram_total_mib = dedicated_total_mib if dedicated_total_mib is not None else (mem_total_mib or 0)
+                vram_used_mib = dedicated_used_mib if dedicated_used_mib is not None else (mem_used_mib or 0)
+                vram_percent = (vram_used_mib / vram_total_mib * 100.0) if vram_total_mib else 0.0
+                shared_total = shared_total_mib or 0
+                shared_used = shared_used_mib or 0
+                shared_percent = (shared_used / shared_total * 100.0) if shared_total else 0.0
+
+                stats.append(
+                    SakuraGPUStats(
+                        name=str(hw.Name),
+                        vram_total_mib=vram_total_mib,
+                        vram_used_mib=vram_used_mib,
+                        vram_percent=vram_percent,
+                        shared_total_mib=shared_total,
+                        shared_used_mib=shared_used,
+                        shared_percent=shared_percent,
+                        core_clock_mhz=core_clock_mhz,
+                        util_percent=util_percent,
+                        power_watts=power_watts,
+                        temperature_c=temperature_c,
+                    )
+                )
+        except Exception:  # noqa: BLE001
+            return []
+
+        return stats
+
+    def shutdown(self) -> None:
+        if self._computer is None:
+            return
+        try:
+            self._computer.Close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class SakuraMetricRow(QWidget):
     def __init__(self, title: str, with_bar: bool = True) -> None:
         super().__init__()
+        self.with_bar = with_bar
         self.title = QLabel(title)
+        self.title.setObjectName("SakuraMetricTitle")
         self.value = QLabel("-")
+        self.value.setObjectName("SakuraMetricValue")
         self.value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.bar = QProgressBar()
+        self.bar.setObjectName("SakuraBar")
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
         self.bar.setTextVisible(False)
-        self.bar.setFixedHeight(12)
+        self.bar.setFixedHeight(14)
         if not with_bar:
             self.bar.hide()
 
@@ -232,10 +610,70 @@ class SakuraMetricRow(QWidget):
         layout.setSpacing(4)
         layout.addLayout(top)
         layout.addWidget(self.bar)
+        if with_bar:
+            self._apply_bar_color(0.0)
+
+    @staticmethod
+    def temperature_to_percent(temp_c: float) -> float:
+        return max(0.0, min(100.0, temp_c))
+
+    @staticmethod
+    def _blend_channel(start: int, end: int, ratio: float) -> int:
+        return int(round(start + (end - start) * ratio))
+
+    @classmethod
+    def _interpolate_color(cls, percent: float) -> QColor:
+        p = max(0.0, min(100.0, percent))
+        if p <= 30.0:
+            return QColor("#A8E4FF")
+        if p <= 45.0:
+            ratio = (p - 30.0) / 15.0
+            start = QColor("#A8E4FF")
+            end = QColor("#FF8FC9")
+        elif p <= 80.0:
+            ratio = (p - 45.0) / 35.0
+            start = QColor("#FF8FC9")
+            end = QColor("#FF4D4D")
+        else:
+            ratio = (p - 80.0) / 20.0
+            start = QColor("#FF4D4D")
+            end = QColor("#D7263D")
+
+        return QColor(
+            cls._blend_channel(start.red(), end.red(), ratio),
+            cls._blend_channel(start.green(), end.green(), ratio),
+            cls._blend_channel(start.blue(), end.blue(), ratio),
+        )
+
+    def _apply_bar_color(self, percent: float) -> None:
+        base = self._interpolate_color(percent)
+        glow = base.lighter(125)
+        self.bar.setStyleSheet(
+            f"""
+            QProgressBar#SakuraBar {{
+                border: 1px solid #DDB2C1;
+                border-radius: 7px;
+                background-color: #FFEAF1;
+            }}
+            QProgressBar#SakuraBar::chunk {{
+                border-radius: 7px;
+                background-color: qlineargradient(
+                    spread: pad,
+                    x1: 0,
+                    y1: 0.5,
+                    x2: 1,
+                    y2: 0.5,
+                    stop: 0 {glow.name()},
+                    stop: 1 {base.name()}
+                );
+            }}
+            """
+        )
 
     def set_percent(self, percent: float, text: str) -> None:
         bounded = max(0, min(100, int(round(percent))))
         self.bar.setValue(bounded)
+        self._apply_bar_color(float(bounded))
         self.value.setText(text)
 
     def set_text(self, text: str) -> None:
@@ -245,18 +683,28 @@ class SakuraMetricRow(QWidget):
 class SakuraGPUCard(QGroupBox):
     def __init__(self, gpu_index: int, gpu_name: str) -> None:
         super().__init__(f"GPU {gpu_index}: {gpu_name}")
+        self.setObjectName("SakuraDeviceCard")
         self.vram_row = SakuraMetricRow("GPU Memory")
+        self.shared_row = SakuraMetricRow("Shared Memory")
         self.util_row = SakuraMetricRow("GPU Utilization")
+        self.temp_row = SakuraMetricRow("Temperature")
         self.clock_row = SakuraMetricRow("Core Clock", with_bar=False)
         self.power_row = SakuraMetricRow("Power Draw", with_bar=False)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 12, 10, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 16, 14, 14)
+        layout.setSpacing(12)
         layout.addWidget(self.vram_row)
+        layout.addWidget(self.shared_row)
         layout.addWidget(self.util_row)
-        layout.addWidget(self.clock_row)
-        layout.addWidget(self.power_row)
+        layout.addWidget(self.temp_row)
+
+        details_row = QHBoxLayout()
+        details_row.setContentsMargins(0, 0, 0, 0)
+        details_row.setSpacing(12)
+        details_row.addWidget(self.clock_row)
+        details_row.addWidget(self.power_row)
+        layout.addLayout(details_row)
 
     def apply_stats(self, stats: SakuraGPUStats) -> None:
         if stats.vram_total_mib <= 0:
@@ -267,10 +715,26 @@ class SakuraGPUCard(QGroupBox):
                 f"{stats.vram_used_mib:,} / {stats.vram_total_mib:,} MiB ({stats.vram_percent:.1f}%)",
             )
 
+        if stats.shared_total_mib <= 0:
+            self.shared_row.set_percent(0, "N/A")
+        else:
+            self.shared_row.set_percent(
+                stats.shared_percent,
+                f"{stats.shared_used_mib:,} / {stats.shared_total_mib:,} MiB ({stats.shared_percent:.1f}%)",
+            )
+
         if stats.util_percent is None:
             self.util_row.set_percent(0, "N/A")
         else:
             self.util_row.set_percent(stats.util_percent, f"{stats.util_percent:.1f}%")
+
+        if stats.temperature_c is None:
+            self.temp_row.set_percent(0, "N/A")
+        else:
+            self.temp_row.set_percent(
+                SakuraMetricRow.temperature_to_percent(stats.temperature_c),
+                f"{stats.temperature_c:.1f} C",
+            )
 
         if stats.core_clock_mhz is None:
             self.clock_row.set_text("N/A")
@@ -1166,6 +1630,8 @@ class MainWindow(QMainWindow):
         self.server_running_states = [False, False, False, False]
         self._model_compat_warning_shown: set[int] = set()
         self.sakura_monitor = SakuraNvidiaMonitor()
+        self.sakura_lhm = SakuraLibreHardwareMonitorBridge()
+        self.sakura_expected_runtime = PROJECT_ROOT / ".venv311" / "Scripts" / "python.exe"
         self.sakura_timer = QTimer(self)
         self.sakura_timer.setInterval(1000)
         self.sakura_timer.timeout.connect(self._refresh_sakura_panel)
@@ -1257,6 +1723,20 @@ class MainWindow(QMainWindow):
                 color: #6a3f55;
             }}
 
+            QGroupBox#SakuraDeviceCard {{
+                background: rgba(255, 247, 251, 236);
+                border: 1px solid #E5BAC8;
+                border-radius: 14px;
+                margin-top: 8px;
+                padding-top: 8px;
+            }}
+
+            QGroupBox#SakuraDeviceCard::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+            }}
+
             QLineEdit,
             QTextEdit,
             QPlainTextEdit,
@@ -1335,6 +1815,22 @@ class MainWindow(QMainWindow):
             QSplitter,
             QLabel {{
                 background: transparent;
+            }}
+
+            QLabel#SakuraMetricTitle {{
+                font-weight: 600;
+                color: #6A2A3F;
+            }}
+
+            QLabel#SakuraMetricValue {{
+                color: #7A3A4E;
+                font-weight: 600;
+            }}
+
+            QProgressBar#SakuraBar {{
+                border: 1px solid #DDB2C1;
+                border-radius: 7px;
+                background: #FFEAF1;
             }}
             """
         )
@@ -1889,21 +2385,45 @@ class MainWindow(QMainWindow):
         sakura_scroll.setWidget(sakura_body)
 
         self.sakura_cpu_row = SakuraMetricRow("CPU Utilization")
+        self.sakura_cpu_temp_row = SakuraMetricRow("CPU Temperature")
+        self.sakura_cpu_power_row = SakuraMetricRow("CPU Power", with_bar=False)
         self.sakura_ram_row = SakuraMetricRow("System RAM")
+        self.sakura_ram_temp_row = SakuraMetricRow("RAM Temperature")
+        self.sakura_ram_power_row = SakuraMetricRow("RAM Power", with_bar=False)
         self.sakura_diag_python_row = SakuraMetricRow("Python", with_bar=False)
+        self.sakura_diag_runtime_row = SakuraMetricRow("Expected Runtime", with_bar=False)
         self.sakura_diag_nvml_row = SakuraMetricRow("NVML GPUs", with_bar=False)
+        self.sakura_diag_lhm_row = SakuraMetricRow("LHM GPUs", with_bar=False)
+        self.sakura_diag_lhm_status_row = SakuraMetricRow("LHM Status", with_bar=False)
 
         system_box = QGroupBox("CPU + System Memory")
+        system_box.setObjectName("SakuraDeviceCard")
         system_layout = QVBoxLayout(system_box)
         system_layout.addWidget(self.sakura_cpu_row)
+        system_layout.addWidget(self.sakura_cpu_temp_row)
         system_layout.addWidget(self.sakura_ram_row)
+        system_layout.addWidget(self.sakura_ram_temp_row)
+
+        power_row = QHBoxLayout()
+        power_row.setContentsMargins(0, 0, 0, 0)
+        power_row.setSpacing(12)
+        power_row.addWidget(self.sakura_cpu_power_row)
+        power_row.addWidget(self.sakura_ram_power_row)
+        system_layout.addLayout(power_row)
 
         diag_box = QGroupBox("Runtime Diagnostics")
-        diag_layout = QVBoxLayout(diag_box)
-        diag_layout.addWidget(self.sakura_diag_python_row)
-        diag_layout.addWidget(self.sakura_diag_nvml_row)
+        diag_box.setObjectName("SakuraDeviceCard")
+        diag_layout = QGridLayout(diag_box)
+        diag_layout.setContentsMargins(14, 16, 14, 14)
+        diag_layout.setHorizontalSpacing(12)
+        diag_layout.setVerticalSpacing(10)
+        diag_layout.addWidget(self.sakura_diag_python_row, 0, 0)
+        diag_layout.addWidget(self.sakura_diag_runtime_row, 0, 1)
+        diag_layout.addWidget(self.sakura_diag_nvml_row, 1, 0)
+        diag_layout.addWidget(self.sakura_diag_lhm_row, 1, 1)
+        diag_layout.addWidget(self.sakura_diag_lhm_status_row, 2, 0, 1, 2)
 
-        self.sakura_no_gpu_label = QLabel("No NVIDIA GPU telemetry available.")
+        self.sakura_no_gpu_label = QLabel("No GPU telemetry found from NVML or LibreHardwareMonitor backends.")
         self.sakura_no_gpu_label.setWordWrap(True)
 
         self.sakura_body_layout.addWidget(system_box)
@@ -1940,6 +2460,106 @@ class MainWindow(QMainWindow):
         self.sakura_timer.start()
         return panel
 
+    @staticmethod
+    def _normalize_sakura_gpu_name(name: str) -> str:
+        normalized = "".join(ch.lower() for ch in name if ch.isalnum() or ch.isspace())
+        for token in ("nvidia", "amd", "radeon", "geforce"):
+            normalized = normalized.replace(token, " ")
+        return " ".join(normalized.split())
+
+    @staticmethod
+    def _sakura_gpu_name_matches(left: str, right: str) -> bool:
+        if left == right:
+            return True
+        if not left or not right:
+            return False
+        return left in right or right in left
+
+    @classmethod
+    def _merge_sakura_gpu_stats(
+        cls,
+        nvml_stats: list[SakuraGPUStats],
+        lhm_stats: list[SakuraGPUStats],
+    ) -> list[SakuraGPUStats]:
+        merged = list(nvml_stats)
+        lhm_matched: set[int] = set()
+
+        def apply_missing_fields(target: SakuraGPUStats, source: SakuraGPUStats) -> None:
+            if target.vram_total_mib <= 0 and source.vram_total_mib > 0:
+                target.vram_total_mib = source.vram_total_mib
+                target.vram_used_mib = source.vram_used_mib
+                target.vram_percent = source.vram_percent
+            if target.shared_total_mib <= 0 and source.shared_total_mib > 0:
+                target.shared_total_mib = source.shared_total_mib
+                target.shared_used_mib = source.shared_used_mib
+                target.shared_percent = source.shared_percent
+            if target.util_percent is None and source.util_percent is not None:
+                target.util_percent = source.util_percent
+            if target.core_clock_mhz is None and source.core_clock_mhz is not None:
+                target.core_clock_mhz = source.core_clock_mhz
+            if target.power_watts is None and source.power_watts is not None:
+                target.power_watts = source.power_watts
+            if target.temperature_c is None and source.temperature_c is not None:
+                target.temperature_c = source.temperature_c
+
+        for nvml_item in merged:
+            nvml_key = cls._normalize_sakura_gpu_name(nvml_item.name)
+            best_index: int | None = None
+
+            for idx, lhm_item in enumerate(lhm_stats):
+                if idx in lhm_matched:
+                    continue
+                lhm_key = cls._normalize_sakura_gpu_name(lhm_item.name)
+                if cls._sakura_gpu_name_matches(nvml_key, lhm_key):
+                    best_index = idx
+                    break
+
+            if best_index is None:
+                continue
+
+            lhm_matched.add(best_index)
+            apply_missing_fields(nvml_item, lhm_stats[best_index])
+
+        for idx, lhm_item in enumerate(lhm_stats):
+            if idx not in lhm_matched:
+                merged.append(lhm_item)
+
+        return merged
+
+    def _collect_sakura_gpu_sources(self) -> tuple[list[SakuraGPUStats], int, int]:
+        nvml_stats = self.sakura_monitor.collect()
+        lhm_stats = self.sakura_lhm.collect_gpu_stats()
+        merged = self._merge_sakura_gpu_stats(nvml_stats, lhm_stats)
+        return merged, len(nvml_stats), len(lhm_stats)
+
+    def _collect_sakura_system_stats(self) -> SakuraSystemStats:
+        cpu_percent = 0.0
+        ram_total_gib = 0.0
+        ram_used_gib = 0.0
+        ram_percent = 0.0
+        if psutil is not None:
+            try:
+                cpu_percent = float(psutil.cpu_percent(interval=None))
+                mem = psutil.virtual_memory()
+                ram_total_gib = mem.total / (1024 ** 3)
+                ram_used_gib = (mem.total - mem.available) / (1024 ** 3)
+                ram_percent = float(mem.percent)
+            except Exception:  # noqa: BLE001
+                cpu_percent = 0.0
+
+        cpu_power_watts, ram_power_watts, cpu_temp_c, ram_temp_c = self.sakura_lhm.collect_cpu_ram_telemetry()
+
+        return SakuraSystemStats(
+            cpu_percent=cpu_percent,
+            cpu_power_watts=cpu_power_watts,
+            cpu_temp_c=cpu_temp_c,
+            ram_total_gib=ram_total_gib,
+            ram_used_gib=ram_used_gib,
+            ram_percent=ram_percent,
+            ram_power_watts=ram_power_watts,
+            ram_temp_c=ram_temp_c,
+        )
+
     def _rebuild_sakura_gpu_cards(self, gpu_stats: list[SakuraGPUStats]) -> None:
         for card in self.sakura_gpu_cards:
             card.setParent(None)
@@ -1960,37 +2580,58 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "sakura_updated_label"):
             return
 
-        cpu_percent = 0.0
-        ram_used_gib = 0.0
-        ram_total_gib = 0.0
-        ram_percent = 0.0
-        if psutil is not None:
-            try:
-                cpu_percent = float(psutil.cpu_percent(interval=None))
-                mem = psutil.virtual_memory()
-                ram_total_gib = mem.total / (1024 ** 3)
-                ram_used_gib = (mem.total - mem.available) / (1024 ** 3)
-                ram_percent = float(mem.percent)
-            except Exception:  # noqa: BLE001
-                cpu_percent = 0.0
+        system_stats = self._collect_sakura_system_stats()
+        self.sakura_cpu_row.set_percent(system_stats.cpu_percent, f"{system_stats.cpu_percent:.1f}%")
 
-        self.sakura_cpu_row.set_percent(cpu_percent, f"{cpu_percent:.1f}%")
-        if ram_total_gib > 0:
+        if system_stats.cpu_temp_c is None:
+            self.sakura_cpu_temp_row.set_percent(0, "N/A")
+        else:
+            self.sakura_cpu_temp_row.set_percent(
+                SakuraMetricRow.temperature_to_percent(system_stats.cpu_temp_c),
+                f"{system_stats.cpu_temp_c:.1f} C",
+            )
+
+        if system_stats.cpu_power_watts is None:
+            self.sakura_cpu_power_row.set_text("N/A")
+        else:
+            self.sakura_cpu_power_row.set_text(f"{system_stats.cpu_power_watts:.1f} W")
+
+        if system_stats.ram_total_gib > 0:
             self.sakura_ram_row.set_percent(
-                ram_percent,
-                f"{ram_used_gib:.2f} / {ram_total_gib:.2f} GiB ({ram_percent:.1f}%)",
+                system_stats.ram_percent,
+                f"{system_stats.ram_used_gib:.2f} / {system_stats.ram_total_gib:.2f} GiB ({system_stats.ram_percent:.1f}%)",
             )
         else:
             self.sakura_ram_row.set_percent(0, "N/A")
 
-        gpu_stats = self.sakura_monitor.collect()
+        if system_stats.ram_temp_c is None:
+            self.sakura_ram_temp_row.set_percent(0, "N/A")
+        else:
+            self.sakura_ram_temp_row.set_percent(
+                SakuraMetricRow.temperature_to_percent(system_stats.ram_temp_c),
+                f"{system_stats.ram_temp_c:.1f} C",
+            )
+
+        if system_stats.ram_power_watts is None:
+            self.sakura_ram_power_row.set_text("N/A")
+        else:
+            self.sakura_ram_power_row.set_text(f"{system_stats.ram_power_watts:.1f} W")
+
+        gpu_stats, nvml_count, lhm_count = self._collect_sakura_gpu_sources()
         if len(gpu_stats) != len(self.sakura_gpu_cards):
             self._rebuild_sakura_gpu_cards(gpu_stats)
         for card, stats in zip(self.sakura_gpu_cards, gpu_stats):
             card.apply_stats(stats)
 
         self.sakura_diag_python_row.set_text(f"{sys.version.split()[0]} ({Path(sys.executable).name})")
-        self.sakura_diag_nvml_row.set_text(str(len(gpu_stats)))
+        if self.sakura_expected_runtime.exists():
+            runtime_text = "OK" if Path(sys.executable).resolve() == self.sakura_expected_runtime.resolve() else "Fallback"
+        else:
+            runtime_text = "Current"
+        self.sakura_diag_runtime_row.set_text(runtime_text)
+        self.sakura_diag_nvml_row.set_text(str(nvml_count))
+        self.sakura_diag_lhm_row.set_text(str(lhm_count))
+        self.sakura_diag_lhm_status_row.set_text(self.sakura_lhm.status)
         self.sakura_updated_label.setText(
             f"Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
@@ -3966,6 +4607,7 @@ class MainWindow(QMainWindow):
             self._save_config()
             self.sakura_timer.stop()
             self.sakura_monitor.shutdown()
+            self.sakura_lhm.shutdown()
             for slot in self.server_slots:
                 if slot.process.state() != QProcess.NotRunning:
                     slot.process.kill()
