@@ -7,3 +7,5 @@ torch>=2.0
 safetensors>=0.4
 transformers>=4.36
 sentencepiece>=0.1
+psutil>=6.0.0
+pynvml>=11.5.0

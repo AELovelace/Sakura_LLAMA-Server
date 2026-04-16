@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 import requests
 from huggingface_hub import HfApi, hf_hub_url, snapshot_download
-from PySide6.QtCore import QProcess, QProcessEnvironment, QRunnable, QThreadPool, Qt, QObject, Signal
+from PySide6.QtCore import QProcess, QProcessEnvironment, QRunnable, QThreadPool, Qt, QObject, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -53,6 +53,16 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    import psutil
+except Exception:  # noqa: BLE001
+    psutil = None
+
+try:
+    import pynvml
+except Exception:  # noqa: BLE001
+    pynvml = None
 
 
 APP_NAME = "DoLLAMACPP Frontend"
@@ -109,6 +119,168 @@ class GPUDevice:
     label: str
     backend: str
     env_id: str
+
+
+@dataclass
+class SakuraGPUStats:
+    name: str
+    vram_total_mib: int
+    vram_used_mib: int
+    vram_percent: float
+    util_percent: float | None
+    core_clock_mhz: int | None
+    power_watts: float | None
+
+
+class SakuraNvidiaMonitor:
+    def __init__(self) -> None:
+        self.ready = False
+        self.handles: list[Any] = []
+        if pynvml is None:
+            return
+        try:
+            pynvml.nvmlInit()
+            count = pynvml.nvmlDeviceGetCount()
+            for index in range(count):
+                self.handles.append(pynvml.nvmlDeviceGetHandleByIndex(index))
+            self.ready = bool(self.handles)
+        except Exception:  # noqa: BLE001
+            self.ready = False
+
+    def collect(self) -> list[SakuraGPUStats]:
+        if not self.ready:
+            return []
+
+        stats: list[SakuraGPUStats] = []
+        for handle in self.handles:
+            try:
+                name = pynvml.nvmlDeviceGetName(handle)
+                if isinstance(name, bytes):
+                    name = name.decode("utf-8", "ignore")
+
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                vram_total_mib = int(mem.total / (1024 * 1024))
+                vram_used_mib = int(mem.used / (1024 * 1024))
+                vram_percent = (vram_used_mib / vram_total_mib * 100.0) if vram_total_mib else 0.0
+
+                util_percent: float | None = None
+                try:
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    util_percent = float(util.gpu)
+                except Exception:  # noqa: BLE001
+                    util_percent = None
+
+                core_clock_mhz: int | None = None
+                try:
+                    core_clock_mhz = int(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_GRAPHICS))
+                except Exception:  # noqa: BLE001
+                    core_clock_mhz = None
+
+                power_watts: float | None = None
+                try:
+                    power_watts = float(pynvml.nvmlDeviceGetPowerUsage(handle)) / 1000.0
+                except Exception:  # noqa: BLE001
+                    power_watts = None
+
+                stats.append(
+                    SakuraGPUStats(
+                        name=str(name),
+                        vram_total_mib=vram_total_mib,
+                        vram_used_mib=vram_used_mib,
+                        vram_percent=vram_percent,
+                        util_percent=util_percent,
+                        core_clock_mhz=core_clock_mhz,
+                        power_watts=power_watts,
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                continue
+
+        return stats
+
+    def shutdown(self) -> None:
+        if not self.ready:
+            return
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class SakuraMetricRow(QWidget):
+    def __init__(self, title: str, with_bar: bool = True) -> None:
+        super().__init__()
+        self.title = QLabel(title)
+        self.value = QLabel("-")
+        self.value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.bar.setValue(0)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(12)
+        if not with_bar:
+            self.bar.hide()
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addWidget(self.title)
+        top.addWidget(self.value)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addLayout(top)
+        layout.addWidget(self.bar)
+
+    def set_percent(self, percent: float, text: str) -> None:
+        bounded = max(0, min(100, int(round(percent))))
+        self.bar.setValue(bounded)
+        self.value.setText(text)
+
+    def set_text(self, text: str) -> None:
+        self.value.setText(text)
+
+
+class SakuraGPUCard(QGroupBox):
+    def __init__(self, gpu_index: int, gpu_name: str) -> None:
+        super().__init__(f"GPU {gpu_index}: {gpu_name}")
+        self.vram_row = SakuraMetricRow("GPU Memory")
+        self.util_row = SakuraMetricRow("GPU Utilization")
+        self.clock_row = SakuraMetricRow("Core Clock", with_bar=False)
+        self.power_row = SakuraMetricRow("Power Draw", with_bar=False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 12, 10, 10)
+        layout.setSpacing(10)
+        layout.addWidget(self.vram_row)
+        layout.addWidget(self.util_row)
+        layout.addWidget(self.clock_row)
+        layout.addWidget(self.power_row)
+
+    def apply_stats(self, stats: SakuraGPUStats) -> None:
+        if stats.vram_total_mib <= 0:
+            self.vram_row.set_percent(0, "N/A")
+        else:
+            self.vram_row.set_percent(
+                stats.vram_percent,
+                f"{stats.vram_used_mib:,} / {stats.vram_total_mib:,} MiB ({stats.vram_percent:.1f}%)",
+            )
+
+        if stats.util_percent is None:
+            self.util_row.set_percent(0, "N/A")
+        else:
+            self.util_row.set_percent(stats.util_percent, f"{stats.util_percent:.1f}%")
+
+        if stats.core_clock_mhz is None:
+            self.clock_row.set_text("N/A")
+        else:
+            self.clock_row.set_text(f"{stats.core_clock_mhz:,} MHz")
+
+        if stats.power_watts is None:
+            self.power_row.set_text("N/A")
+        else:
+            self.power_row.set_text(f"{stats.power_watts:.1f} W")
 
 
 @dataclass
@@ -992,6 +1164,11 @@ class MainWindow(QMainWindow):
         self.available_devices: list[GPUDevice] = self._detect_available_devices()
         self.server_slots: list[ServerSlot] = []
         self.server_running_states = [False, False, False, False]
+        self.sakura_monitor = SakuraNvidiaMonitor()
+        self.sakura_timer = QTimer(self)
+        self.sakura_timer.setInterval(1000)
+        self.sakura_timer.timeout.connect(self._refresh_sakura_panel)
+        self.sakura_gpu_cards: list[SakuraGPUCard] = []
         self._snapshot_lock = threading.Lock()
         self._ollama_snapshot: dict[str, Any] = {
             "default_server": 0,
@@ -1687,15 +1864,134 @@ class MainWindow(QMainWindow):
         return container
 
     def _build_log_panel(self) -> QWidget:
-        box = QGroupBox("Server Log")
-        layout = QVBoxLayout(box)
+        panel = QWidget()
+        root = QVBoxLayout(panel)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        sakura_box = QGroupBox("Sakura Load Monitor")
+        sakura_layout = QVBoxLayout(sakura_box)
+
+        self.sakura_updated_label = QLabel("Last update: --")
+        sakura_layout.addWidget(self.sakura_updated_label)
+
+        sakura_scroll = QScrollArea()
+        sakura_scroll.setWidgetResizable(True)
+        sakura_layout.addWidget(sakura_scroll)
+
+        sakura_body = QWidget()
+        self.sakura_body_layout = QVBoxLayout(sakura_body)
+        self.sakura_body_layout.setContentsMargins(4, 4, 4, 4)
+        self.sakura_body_layout.setSpacing(8)
+        sakura_scroll.setWidget(sakura_body)
+
+        self.sakura_cpu_row = SakuraMetricRow("CPU Utilization")
+        self.sakura_ram_row = SakuraMetricRow("System RAM")
+        self.sakura_diag_python_row = SakuraMetricRow("Python", with_bar=False)
+        self.sakura_diag_nvml_row = SakuraMetricRow("NVML GPUs", with_bar=False)
+
+        system_box = QGroupBox("CPU + System Memory")
+        system_layout = QVBoxLayout(system_box)
+        system_layout.addWidget(self.sakura_cpu_row)
+        system_layout.addWidget(self.sakura_ram_row)
+
+        diag_box = QGroupBox("Runtime Diagnostics")
+        diag_layout = QVBoxLayout(diag_box)
+        diag_layout.addWidget(self.sakura_diag_python_row)
+        diag_layout.addWidget(self.sakura_diag_nvml_row)
+
+        self.sakura_no_gpu_label = QLabel("No NVIDIA GPU telemetry available.")
+        self.sakura_no_gpu_label.setWordWrap(True)
+
+        self.sakura_body_layout.addWidget(system_box)
+        self.sakura_body_layout.addWidget(diag_box)
+        self.sakura_body_layout.addWidget(self.sakura_no_gpu_label)
+
+        self.sakura_gpu_container = QWidget()
+        self.sakura_gpu_layout = QVBoxLayout(self.sakura_gpu_container)
+        self.sakura_gpu_layout.setContentsMargins(0, 0, 0, 0)
+        self.sakura_gpu_layout.setSpacing(8)
+        self.sakura_body_layout.addWidget(self.sakura_gpu_container)
+        self.sakura_body_layout.addStretch(1)
+
+        log_box = QGroupBox("Server Log")
+        log_layout = QVBoxLayout(log_box)
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.clear_log_button = QPushButton("Clear Log")
         self.clear_log_button.clicked.connect(self.log_output.clear)
-        layout.addWidget(self.clear_log_button)
-        layout.addWidget(self.log_output)
-        return box
+        log_layout.addWidget(self.clear_log_button)
+        log_layout.addWidget(self.log_output)
+
+        splitter.addWidget(sakura_box)
+        splitter.addWidget(log_box)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([700, 700])
+
+        root.addWidget(splitter)
+
+        if psutil is not None:
+            psutil.cpu_percent(interval=None)
+        self._refresh_sakura_panel()
+        self.sakura_timer.start()
+        return panel
+
+    def _rebuild_sakura_gpu_cards(self, gpu_stats: list[SakuraGPUStats]) -> None:
+        for card in self.sakura_gpu_cards:
+            card.setParent(None)
+        self.sakura_gpu_cards.clear()
+
+        if not gpu_stats:
+            self.sakura_no_gpu_label.show()
+            return
+
+        self.sakura_no_gpu_label.hide()
+        for idx, stats in enumerate(gpu_stats):
+            card = SakuraGPUCard(idx, stats.name)
+            card.apply_stats(stats)
+            self.sakura_gpu_cards.append(card)
+            self.sakura_gpu_layout.addWidget(card)
+
+    def _refresh_sakura_panel(self) -> None:
+        if not hasattr(self, "sakura_updated_label"):
+            return
+
+        cpu_percent = 0.0
+        ram_used_gib = 0.0
+        ram_total_gib = 0.0
+        ram_percent = 0.0
+        if psutil is not None:
+            try:
+                cpu_percent = float(psutil.cpu_percent(interval=None))
+                mem = psutil.virtual_memory()
+                ram_total_gib = mem.total / (1024 ** 3)
+                ram_used_gib = (mem.total - mem.available) / (1024 ** 3)
+                ram_percent = float(mem.percent)
+            except Exception:  # noqa: BLE001
+                cpu_percent = 0.0
+
+        self.sakura_cpu_row.set_percent(cpu_percent, f"{cpu_percent:.1f}%")
+        if ram_total_gib > 0:
+            self.sakura_ram_row.set_percent(
+                ram_percent,
+                f"{ram_used_gib:.2f} / {ram_total_gib:.2f} GiB ({ram_percent:.1f}%)",
+            )
+        else:
+            self.sakura_ram_row.set_percent(0, "N/A")
+
+        gpu_stats = self.sakura_monitor.collect()
+        if len(gpu_stats) != len(self.sakura_gpu_cards):
+            self._rebuild_sakura_gpu_cards(gpu_stats)
+        for card, stats in zip(self.sakura_gpu_cards, gpu_stats):
+            card.apply_stats(stats)
+
+        self.sakura_diag_python_row.set_text(f"{sys.version.split()[0]} ({Path(sys.executable).name})")
+        self.sakura_diag_nvml_row.set_text(str(len(gpu_stats)))
+        self.sakura_updated_label.setText(
+            f"Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
     def _build_chat_panel(self) -> QWidget:
         box = QGroupBox("Chat Tester")
@@ -3584,6 +3880,8 @@ class MainWindow(QMainWindow):
             self.tray_icon.hide()
             self.stop_ollama_proxy()
             self._save_config()
+            self.sakura_timer.stop()
+            self.sakura_monitor.shutdown()
             for slot in self.server_slots:
                 if slot.process.state() != QProcess.NotRunning:
                     slot.process.kill()
