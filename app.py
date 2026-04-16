@@ -2167,7 +2167,7 @@ class MainWindow(QMainWindow):
                 "Download Converter",
                 "convert_hf_to_gguf.py was not found locally.\n\n"
                 "Would you like to download it from the llama.cpp repository?\n"
-                "(Only the converter script will be downloaded, ~200 KB)",
+                "(The converter script + matching gguf package will be installed)",
                 QMessageBox.Yes | QMessageBox.No,
             )
             if reply == QMessageBox.Yes:
@@ -2274,16 +2274,63 @@ class MainWindow(QMainWindow):
         return None
 
     def _download_convert_script(self) -> Path | None:
-        """Download convert_hf_to_gguf.py from the llama.cpp GitHub repo."""
-        url = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/convert_hf_to_gguf.py"
+        """Download convert_hf_to_gguf.py and the matching gguf package from
+        the latest stable llama.cpp release tag.  Using a release tag (not
+        master) ensures the convert script and the gguf Python package are
+        in sync — master often has new model classes before the constants
+        are added to gguf-py."""
         dest = Path(__file__).resolve().parent / "scripts" / "convert_hf_to_gguf.py"
         dest.parent.mkdir(parents=True, exist_ok=True)
+
+        # 1. Determine the latest release tag via the GitHub API.
+        tag = None
         try:
-            response = requests.get(url, timeout=30)
+            api_resp = requests.get(
+                "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest",
+                headers={"Accept": "application/vnd.github+json"},
+                timeout=15,
+            )
+            if api_resp.status_code == 200:
+                tag = api_resp.json().get("tag_name")
+        except Exception:  # noqa: BLE001
+            pass
+
+        if not tag:
+            # Fallback: try the tags endpoint (cheaper rate-limit wise).
+            try:
+                tags_resp = requests.get(
+                    "https://api.github.com/repos/ggml-org/llama.cpp/tags?per_page=1",
+                    headers={"Accept": "application/vnd.github+json"},
+                    timeout=15,
+                )
+                if tags_resp.status_code == 200:
+                    tags = tags_resp.json()
+                    if tags:
+                        tag = tags[0].get("name")
+            except Exception:  # noqa: BLE001
+                pass
+
+        if not tag:
+            QMessageBox.critical(
+                self,
+                "Release Lookup Failed",
+                "Could not determine the latest llama.cpp release tag.\n"
+                "Check your internet connection and try again.",
+            )
+            return None
+
+        self.log_output.appendPlainText(f"[CONVERT] Using llama.cpp release: {tag}")
+
+        # 2. Download the convert script from that tag.
+        script_url = (
+            f"https://raw.githubusercontent.com/ggml-org/llama.cpp/{tag}/"
+            f"convert_hf_to_gguf.py"
+        )
+        try:
+            response = requests.get(script_url, timeout=30)
             response.raise_for_status()
             dest.write_text(response.text, encoding="utf-8")
-            self.log_output.appendPlainText(f"[CONVERT] Downloaded convert_hf_to_gguf.py → {dest}")
-            return dest
+            self.log_output.appendPlainText(f"[CONVERT] Downloaded convert_hf_to_gguf.py ({tag}) → {dest}")
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(
                 self,
@@ -2292,16 +2339,51 @@ class MainWindow(QMainWindow):
             )
             return None
 
+        # 3. Install the gguf package from the SAME tag so constants match.
+        git_ref = f"gguf@git+https://github.com/ggml-org/llama.cpp@{tag}#subdirectory=gguf-py"
+        self.log_output.appendPlainText(
+            f"[CONVERT] Installing gguf package from llama.cpp {tag}…"
+        )
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "pip", "install", "--upgrade", "--no-deps",
+                "--quiet", git_ref,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if result.returncode != 0:
+            error = result.stderr.strip() or result.stdout.strip()
+            self.log_output.appendPlainText(f"[CONVERT] WARNING: gguf install failed: {error}")
+            QMessageBox.warning(
+                self,
+                "gguf Install Warning",
+                f"Could not install the gguf package from llama.cpp {tag}.\n\n"
+                "The conversion may fail if the installed gguf version is too old.\n\n"
+                f"Error: {error[:300]}",
+            )
+        else:
+            self.log_output.appendPlainText(f"[CONVERT] gguf package installed from {tag}.")
+
+        return dest
+
     @staticmethod
     def _check_conversion_deps() -> list[str]:
-        """Return list of pip package names that are missing."""
+        """Return list of pip package names that are missing.
+
+        Note: gguf is NOT checked here because it is installed directly
+        from the llama.cpp GitHub repo when the convert script is
+        downloaded (see _download_convert_script).  The PyPI version
+        is almost always out of date relative to the convert script.
+        """
         required = {
             "numpy": "numpy",
             "torch": "torch",
             "safetensors": "safetensors",
             "transformers": "transformers",
             "sentencepiece": "sentencepiece",
-            "gguf": "gguf",
         }
         missing: list[str] = []
         for module_name, pip_name in required.items():
@@ -2309,6 +2391,13 @@ class MainWindow(QMainWindow):
                 __import__(module_name)
             except ImportError:
                 missing.append(pip_name)
+        # Always check gguf is importable (it should have been installed
+        # from git by _download_convert_script, but might be missing on
+        # first run if the user supplied their own convert script).
+        try:
+            __import__("gguf")
+        except ImportError:
+            missing.append("gguf@git+https://github.com/ggml-org/llama.cpp#subdirectory=gguf-py")
         return missing
 
     def _install_conversion_deps(self, packages: list[str]) -> bool:
@@ -2316,7 +2405,7 @@ class MainWindow(QMainWindow):
         self.log_output.appendPlainText(f"[CONVERT] Installing: {' '.join(packages)}")
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet"] + packages,
+                [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet"] + packages,
                 capture_output=True,
                 text=True,
                 timeout=600,
