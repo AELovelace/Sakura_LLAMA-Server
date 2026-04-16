@@ -1164,6 +1164,7 @@ class MainWindow(QMainWindow):
         self.available_devices: list[GPUDevice] = self._detect_available_devices()
         self.server_slots: list[ServerSlot] = []
         self.server_running_states = [False, False, False, False]
+        self._model_compat_warning_shown: set[int] = set()
         self.sakura_monitor = SakuraNvidiaMonitor()
         self.sakura_timer = QTimer(self)
         self.sakura_timer.setInterval(1000)
@@ -1736,7 +1737,9 @@ class MainWindow(QMainWindow):
         process.readyReadStandardOutput.connect(lambda i=index: self._append_server_output(i))
         process.errorOccurred.connect(lambda error, i=index: self._handle_process_error(i, error))
         process.started.connect(lambda i=index: self._set_server_state(i, True))
-        process.finished.connect(lambda *_args, i=index: self._set_server_state(i, False))
+        process.finished.connect(
+            lambda exit_code, exit_status, i=index: self._handle_process_finished(i, exit_code, exit_status)
+        )
 
         self.server_slots.append(
             ServerSlot(
@@ -2535,8 +2538,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Model Files", "No convertible model files found.")
             return
 
+        target_index = self._resolve_server_index(None)
+        target_slot = self.server_slots[target_index]
+        target_backend = self._infer_backend(self._selected_devices(target_slot)) or "cpu"
+
         # Locate the convert script
-        convert_script = self._find_convert_script()
+        convert_script = self._find_convert_script(target_backend)
         if not convert_script:
             reply = QMessageBox.question(
                 self,
@@ -2550,6 +2557,10 @@ class MainWindow(QMainWindow):
                 convert_script = self._download_convert_script()
             if not convert_script:
                 return
+
+        self.log_output.appendPlainText(
+            f"[CONVERT] Using converter for backend '{target_backend}': {convert_script}"
+        )
 
         # Check for required Python packages
         missing = self._check_conversion_deps()
@@ -2623,15 +2634,27 @@ class MainWindow(QMainWindow):
     def _cancel_conversion(self) -> None:
         self._conversion_cancelled = True
 
-    def _find_convert_script(self) -> Path | None:
+    def _find_convert_script(self, preferred_backend: str = "cpu") -> Path | None:
         """Search for convert_hf_to_gguf.py in common locations."""
         workspace = Path(__file__).resolve().parent
         candidates: list[Path] = [
             workspace / "scripts" / "convert_hf_to_gguf.py",
             workspace / "convert_hf_to_gguf.py",
         ]
-        # Check near configured llama-server paths
-        for backend in ("cuda", "hip", "vulkan", "cpu"):
+
+        # Check near configured llama-server paths, preferring the backend used
+        # by the selected target server slot.
+        backend_order = [preferred_backend, "cpu", "cuda", "hip", "vulkan"]
+        seen_backends: set[str] = set()
+        ordered_backends: list[str] = []
+        for backend in backend_order:
+            key = (backend or "").strip().lower()
+            if not key or key in seen_backends:
+                continue
+            seen_backends.add(key)
+            ordered_backends.append(key)
+
+        for backend in ordered_backends:
             configured = self._llama_path_input_for_backend(backend).text().strip()
             if configured:
                 base = Path(configured).parent
@@ -3724,6 +3747,8 @@ class MainWindow(QMainWindow):
                 environment.insert("VK_VISIBLE_DEVICES", visible_ids)
 
         slot.process.setProcessEnvironment(environment)
+        self._model_compat_warning_shown.discard(index)
+        slot.status_label.setText("Starting server…")
         self._save_config()
         self.log_output.appendPlainText(f"[S{index + 1}] > {llama_path} {' '.join(arguments)}")
         slot.process.start(llama_path, arguments)
@@ -3803,9 +3828,69 @@ class MainWindow(QMainWindow):
             return
         for line in lines:
             self.log_output.appendPlainText(f"[S{index + 1}] {line}")
+            self._maybe_report_model_compatibility_issue(index, line)
+
+    def _maybe_report_model_compatibility_issue(self, index: int, line: str) -> None:
+        lower = line.lower()
+        mismatch = (
+            "error loading model hyperparameters" in lower
+            or "wrong array length" in lower
+            or "qwen35.rope.dimension_sections" in lower
+        )
+        if not mismatch:
+            return
+
+        if index in self._model_compat_warning_shown:
+            return
+        self._model_compat_warning_shown.add(index)
+
+        slot = self.server_slots[index]
+        model_path = slot.model_path_input.text().strip() or "(unknown model path)"
+        message = (
+            "Model/runtime compatibility issue detected.\n\n"
+            "The GGUF appears to use metadata your current llama-server build does not support "
+            "(or expects in a different format).\n\n"
+            f"Model: {model_path}\n\n"
+            "Fix options:\n"
+            "1) Update the selected backend runtime to a newer llama.cpp build.\n"
+            "2) Re-convert/re-download this model using the same llama.cpp release family as your runtime.\n"
+            "3) Try a different GGUF quant/model variant known to load on your runtime."
+        )
+        slot.status_label.setText("Model/runtime mismatch (see Server Log).")
+        self.log_output.appendPlainText(f"[S{index + 1}] compatibility hint: {message.replace(chr(10), ' ')}")
+        QMessageBox.warning(self, f"Server {index + 1} Model Compatibility", message)
 
     def _handle_process_error(self, index: int, _error: QProcess.ProcessError) -> None:
-        self.server_slots[index].status_label.setText("Server failed to start or crashed.")
+        slot = self.server_slots[index]
+        self._append_server_output(index)
+
+        error_names = {
+            QProcess.ProcessError.FailedToStart: "FailedToStart",
+            QProcess.ProcessError.Crashed: "Crashed",
+            QProcess.ProcessError.Timedout: "Timedout",
+            QProcess.ProcessError.WriteError: "WriteError",
+            QProcess.ProcessError.ReadError: "ReadError",
+            QProcess.ProcessError.UnknownError: "UnknownError",
+        }
+        error_name = error_names.get(_error, str(int(_error)))
+        slot.status_label.setText(f"Server process error: {error_name}")
+        self.log_output.appendPlainText(
+            f"[S{index + 1}] process error: {error_name}"
+        )
+
+    def _handle_process_finished(
+        self,
+        index: int,
+        exit_code: int,
+        exit_status: QProcess.ExitStatus,
+    ) -> None:
+        self._append_server_output(index)
+        self._set_server_state(index, False)
+
+        status_name = "CrashExit" if exit_status == QProcess.ExitStatus.CrashExit else "NormalExit"
+        self.log_output.appendPlainText(
+            f"[S{index + 1}] process exited: code={exit_code}, status={status_name}"
+        )
 
     def _set_server_state(self, index: int, running: bool) -> None:
         slot = self.server_slots[index]
