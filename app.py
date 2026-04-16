@@ -1193,7 +1193,6 @@ class MainWindow(QMainWindow):
         self._build_tray_icon()
 
         # ---- Auto-start (deferred until event loop is running) ----
-        from PySide6.QtCore import QTimer
         QTimer.singleShot(500, self._auto_start_servers)
 
     def _apply_theme(self) -> None:
