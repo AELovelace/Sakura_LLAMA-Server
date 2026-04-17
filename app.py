@@ -1501,9 +1501,10 @@ class OllamaCompatProxy:
         if not isinstance(options, dict):
             options = {}
         snapshot = self._get_snapshot()
-        default_num_predict = int(snapshot.get("proxy_num_predict", 2048) or 2048)
+        default_num_predict = int(snapshot.get("proxy_num_predict", -1) or -1)
         temperature = float(options.get("temperature", payload.get("temperature", 0.7)) or 0.7)
-        max_tokens = int(options.get("num_predict", payload.get("num_predict", default_num_predict)) or default_num_predict)
+        num_predict_val = options.get("num_predict", payload.get("num_predict", None))
+        max_tokens = int(num_predict_val) if num_predict_val is not None else default_num_predict
 
         try:
             text = self._forward_completion(slot, prompt, temperature, max_tokens)
@@ -1573,9 +1574,10 @@ class OllamaCompatProxy:
         if not isinstance(options, dict):
             options = {}
         snapshot = self._get_snapshot()
-        default_num_predict = int(snapshot.get("proxy_num_predict", 2048) or 2048)
+        default_num_predict = int(snapshot.get("proxy_num_predict", -1) or -1)
         temperature = float(options.get("temperature", payload.get("temperature", 0.7)) or 0.7)
-        max_tokens = int(options.get("num_predict", payload.get("num_predict", default_num_predict)) or default_num_predict)
+        num_predict_val = options.get("num_predict", payload.get("num_predict", None))
+        max_tokens = int(num_predict_val) if num_predict_val is not None else default_num_predict
 
         try:
             text = self._forward_chat(slot, messages, temperature, max_tokens)
@@ -1639,7 +1641,7 @@ class MainWindow(QMainWindow):
         self._snapshot_lock = threading.Lock()
         self._ollama_snapshot: dict[str, Any] = {
             "default_server": 0,
-            "proxy_num_predict": 2048,
+            "proxy_num_predict": -1,
             "slots": [],
         }
         self.ollama_proxies: list[OllamaCompatProxy] = [
@@ -2085,11 +2087,12 @@ class MainWindow(QMainWindow):
         ollama_layout.addRow("Proxy Control", self._wrap_layout(ollama_controls))
 
         self.proxy_num_predict_input = QSpinBox()
-        self.proxy_num_predict_input.setRange(1, 131072)
+        self.proxy_num_predict_input.setRange(-1, 131072)
         self.proxy_num_predict_input.setSingleStep(256)
-        self.proxy_num_predict_input.setValue(2048)
+        self.proxy_num_predict_input.setValue(-1)
         self.proxy_num_predict_input.setToolTip(
             "Default max tokens for the Ollama proxy when clients don't specify num_predict.\n"
+            "Set to -1 for unlimited (let the model generate until it naturally stops or hits context).\n"
             "Thinking models (e.g. Qwen3) need high values because reasoning tokens count towards this limit."
         )
         self.proxy_num_predict_input.valueChanged.connect(self._save_config)
@@ -2790,7 +2793,8 @@ class MainWindow(QMainWindow):
 
         self.ollama_host_input.setText(str(data.get("ollama_host", "127.0.0.1") or "127.0.0.1"))
         self.ollama_port_input.setValue(int(data.get("ollama_port", 11434) or 11434))
-        self.proxy_num_predict_input.setValue(int(data.get("proxy_num_predict", 2048) or 2048))
+        raw_pnp = data.get("proxy_num_predict", -1)
+        self.proxy_num_predict_input.setValue(int(raw_pnp) if raw_pnp is not None else -1)
 
         llama_paths = data.get("llama_paths", {})
         if not isinstance(llama_paths, dict):
