@@ -1335,6 +1335,29 @@ class OllamaCompatProxy:
         lines.append("assistant:")
         return "\n".join(lines).strip()
 
+    @staticmethod
+    def _build_openai_payload(
+        *,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        messages: list[dict[str, str]] | None = None,
+        prompt: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": model,
+            "temperature": temperature,
+            "stream": False,
+        }
+        if messages is not None:
+            payload["messages"] = messages
+        if prompt is not None:
+            payload["prompt"] = prompt
+        # Upstream OpenAI-compatible servers may reject negative max_tokens.
+        if max_tokens > 0:
+            payload["max_tokens"] = max_tokens
+        return payload
+
     def _handle_show(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             payload = self._read_json(handler)
@@ -1379,13 +1402,12 @@ class OllamaCompatProxy:
     ) -> str:
         upstream_host = normalize_connect_host(str(slot.get("host", "127.0.0.1") or "127.0.0.1"))
         base_url = f"http://{upstream_host}:{int(slot.get('port', 8080))}"
-        chat_payload = {
-            "model": "local-model",
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
+        chat_payload = self._build_openai_payload(
+            model="local-model",
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
         chat_text: str | None = None
         for attempt in range(3):
@@ -1419,13 +1441,12 @@ class OllamaCompatProxy:
         prompt = self._messages_to_prompt(messages)
         completion_response = requests.post(
             f"{base_url.rstrip('/')}/v1/completions",
-            json={
-                "model": "local-model",
-                "prompt": prompt,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "stream": False,
-            },
+            json=self._build_openai_payload(
+                model="local-model",
+                prompt=prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ),
             timeout=300,
         )
         completion_response.raise_for_status()
@@ -1451,13 +1472,12 @@ class OllamaCompatProxy:
         base_url = f"http://{upstream_host}:{int(slot.get('port', 8080))}"
         response = requests.post(
             f"{base_url.rstrip('/')}/v1/completions",
-            json={
-                "model": "local-model",
-                "prompt": prompt,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "stream": False,
-            },
+            json=self._build_openai_payload(
+                model="local-model",
+                prompt=prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ),
             timeout=300,
         )
         response.raise_for_status()
@@ -1467,17 +1487,24 @@ class OllamaCompatProxy:
 
         chat_response = requests.post(
             f"{base_url.rstrip('/')}/v1/chat/completions",
-            json={
-                "model": "local-model",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "stream": False,
-            },
+            json=self._build_openai_payload(
+                model="local-model",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ),
             timeout=300,
         )
         chat_response.raise_for_status()
-        return self._extract_text_from_chat_choice(chat_response.json())
+        chat_text = self._extract_text_from_chat_choice(chat_response.json())
+        if chat_text:
+            return chat_text
+
+        raise RuntimeError(
+            "Upstream server returned empty content from both /v1/completions and /v1/chat/completions. "
+            "If using a Qwen3 thinking model, try adding '/no_think' at the start of your message, "
+            "or set extra args '--no-reasoning' in the server slot."
+        )
 
     def _handle_generate(self, handler: BaseHTTPRequestHandler) -> None:
         started = time.time()
@@ -1510,6 +1537,9 @@ class OllamaCompatProxy:
             text = self._forward_completion(slot, prompt, temperature, max_tokens)
         except requests.RequestException as exc:
             self._send_error(handler, f"Upstream llama-server request failed: {exc}", 502)
+            return
+        except RuntimeError as exc:
+            self._send_error(handler, str(exc), 502)
             return
 
         stream = bool(payload.get("stream", False))
@@ -1583,6 +1613,9 @@ class OllamaCompatProxy:
             text = self._forward_chat(slot, messages, temperature, max_tokens)
         except requests.RequestException as exc:
             self._send_error(handler, f"Upstream llama-server request failed: {exc}", 502)
+            return
+        except RuntimeError as exc:
+            self._send_error(handler, str(exc), 502)
             return
 
         stream = bool(payload.get("stream", False))
@@ -2089,6 +2122,7 @@ class MainWindow(QMainWindow):
         self.proxy_num_predict_input = QSpinBox()
         self.proxy_num_predict_input.setRange(-1, 131072)
         self.proxy_num_predict_input.setSingleStep(256)
+        self.proxy_num_predict_input.setSpecialValueText("-1 (unlimited)")
         self.proxy_num_predict_input.setValue(-1)
         self.proxy_num_predict_input.setToolTip(
             "Default max tokens for the Ollama proxy when clients don't specify num_predict.\n"
@@ -2111,7 +2145,7 @@ class MainWindow(QMainWindow):
         self.temperature_input.setRange(0, 200)
         self.temperature_input.setValue(70)
         self.chat_max_tokens_input = QSpinBox()
-        self.chat_max_tokens_input.setRange(1, 32768)
+        self.chat_max_tokens_input.setRange(1, 131072)
         self.chat_max_tokens_input.setValue(512)
         generation_layout.addWidget(QLabel("Temp x100"), 0, 0)
         generation_layout.addWidget(self.temperature_input, 0, 1)
