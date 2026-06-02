@@ -78,9 +78,10 @@ CONFIG_PATH = Path("frontend_config.json")
 MODELS_DIR = Path("models")
 LLAMA_CPP_RELEASES_URL = "https://github.com/ggml-org/llama.cpp/releases"
 OLLAMA_BLOBS_DIR = Path(os.environ.get("OLLAMA_MODELS", "")) / "blobs" if os.environ.get("OLLAMA_MODELS") else Path.home() / ".ollama" / "models" / "blobs"
+OLLAMA_MANIFESTS_DIR = Path(os.environ.get("OLLAMA_MODELS", "")) / "manifests" if os.environ.get("OLLAMA_MODELS") else Path.home() / ".ollama" / "models" / "manifests"
 PROJECT_ROOT = Path(__file__).resolve().parent
 SAKURA_LIB_DIR = PROJECT_ROOT / "lib"
-SAKURA_LHM_VERSION = "0.9.6"
+SAKURA_LHM_VERSION = "0.9.4"
 SAKURA_LHM_ARCHIVE_NAME = "lhm_netfx.zip"
 SAKURA_LHM_ARCHIVE_URLS = [
     (
@@ -141,6 +142,7 @@ class GPUDevice:
     label: str
     backend: str
     env_id: str
+    device_name: str
 
 
 @dataclass
@@ -752,6 +754,7 @@ class ServerSlot:
     index: int
     process: QProcess
     backend_label: QLabel
+    gpu_diagnostic_label: QLabel
     ollama_model_input: QLineEdit
     model_path_input: QLineEdit
     host_input: QLineEdit
@@ -2119,6 +2122,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_theme()
         self._load_config()
+        self.refresh_available_devices()
         self._set_ollama_proxy_state(False, "Ollama API proxy is stopped.")
         for slot in self.server_slots:
             self._set_server_state(slot.index, False)
@@ -2419,6 +2423,88 @@ class MainWindow(QMainWindow):
             return "No compute devices detected."
         return "\n".join(f"- {device.label}" for device in devices)
 
+    def _configured_llama_server_path(self, backend: str) -> str:
+        if not hasattr(self, "cuda_llama_path_input"):
+            return ""
+        return self._llama_path_input_for_backend(backend).text().strip()
+
+    @staticmethod
+    def _backend_device_name(backend: str, device_id: str) -> str:
+        return f"{backend.strip().upper()}{device_id}"
+
+    def _parse_llama_server_device_output(self, output: str) -> list[GPUDevice]:
+        devices: list[GPUDevice] = []
+        seen_keys: set[str] = set()
+        seen_names: set[str] = set()
+
+        for line in output.splitlines():
+            row = line.strip()
+            if not row or row.lower().startswith("available devices"):
+                continue
+            if row.startswith("|") or set(row) == {"-"}:
+                continue
+
+            match = re.match(r"([A-Za-z]+)\s*(\d+)\s*:\s*(.+)", row)
+            if not match:
+                continue
+
+            backend = match.group(1).strip().lower()
+            if backend == "cpu":
+                continue
+
+            device_id = match.group(2).strip()
+            label = match.group(3).strip()
+            key = f"{backend}:{device_id}"
+            normalized_name = self._normalize_sakura_gpu_name(label)
+            if key in seen_keys or normalized_name in seen_names:
+                continue
+
+            devices.append(
+                GPUDevice(
+                    key=key,
+                    label=f"{backend.upper()} GPU {device_id}: {label}",
+                    backend=backend,
+                    env_id=device_id,
+                    device_name=self._backend_device_name(backend, device_id),
+                )
+            )
+            seen_keys.add(key)
+            seen_names.add(normalized_name)
+
+        return devices
+
+    def _probe_llama_server_devices(self, backend: str) -> list[GPUDevice]:
+        llama_path = self._configured_llama_server_path(backend)
+        if not llama_path:
+            llama_path = self._auto_detect_llama_server(backend)
+        if not llama_path or not Path(llama_path).exists():
+            return []
+
+        output = self._run_probe_command([llama_path, "--list-devices"])
+        if not output:
+            return []
+
+        return [device for device in self._parse_llama_server_device_output(output) if device.backend == backend]
+
+    def _slot_gpu_diagnostic_text(self, slot: ServerSlot) -> str:
+        selected_devices = self._selected_devices(slot)
+        if not selected_devices:
+            return "Force exact backend GPU: CPU only"
+
+        device_names: list[str] = []
+        for device in selected_devices:
+            if device.backend == "cpu":
+                return "Force exact backend GPU: CPU only"
+            device_name = device.device_name.strip() if device.device_name else self._backend_device_name(device.backend, device.env_id)
+            device_names.append(device_name)
+
+        if not device_names:
+            return "Force exact backend GPU: CPU only"
+        return f"Force exact backend GPU: {', '.join(device_names)}"
+
+    def _update_slot_device_diagnostics(self, slot: ServerSlot) -> None:
+        slot.gpu_diagnostic_label.setText(self._slot_gpu_diagnostic_text(slot))
+
     def pick_global_llama_server(self, backend: str) -> None:
         path, _ = QFileDialog.getOpenFileName(self, f"Select {backend.upper()} llama-server executable")
         if not path:
@@ -2439,6 +2525,12 @@ class MainWindow(QMainWindow):
     def refresh_available_devices(self) -> None:
         self.available_devices = self._detect_available_devices()
         self.detected_devices_label.setText(self._describe_devices(self.available_devices))
+        if hasattr(self, "log_output"):
+            vulkan_devices = [device for device in self.available_devices if device.backend == "vulkan"]
+            if vulkan_devices:
+                self.log_output.appendPlainText("[DEVICE PROBE] Vulkan device order now matches llama-server output:")
+                for device in vulkan_devices:
+                    self.log_output.appendPlainText(f"[DEVICE PROBE]   {device.device_name}: {device.label}")
         for slot in self.server_slots:
             previous = [key for key, checkbox in slot.device_checkboxes.items() if checkbox.isChecked()]
             self._render_slot_device_checkboxes(slot, previous)
@@ -2688,6 +2780,10 @@ class MainWindow(QMainWindow):
         no_cache_prompt_checkbox.setToolTip("Pass --no-cache-prompt to llama-server.")
         form.addRow("No Cache Prompt", no_cache_prompt_checkbox)
 
+        gpu_diagnostic_label = QLabel("Force exact backend GPU: CPU only")
+        gpu_diagnostic_label.setWordWrap(True)
+        form.addRow("GPU Diagnostic", gpu_diagnostic_label)
+
         network_layout = QGridLayout()
         host_input = QLineEdit("127.0.0.1")
         port_input = QSpinBox()
@@ -2760,12 +2856,14 @@ class MainWindow(QMainWindow):
                 stop_button=stop_button,
                 status_label=status_label,
                 proxy_status_label=proxy_status_label,
+                gpu_diagnostic_label=gpu_diagnostic_label,
                 prompt_active=False,
                 prompt_tokens_generated=0,
             )
         )
 
         self._render_slot_device_checkboxes(self.server_slots[-1], ["cpu"])
+        self._update_slot_device_diagnostics(self.server_slots[-1])
 
         return box
     def _build_repo_details_panel(self) -> QWidget:
@@ -3214,9 +3312,94 @@ class MainWindow(QMainWindow):
             return ""
         return completed.stdout or ""
 
+    def _probe_windows_video_controllers(self) -> list[str]:
+        if os.name != "nt":
+            return []
+
+        commands = [
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }",
+            ],
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-WmiObject Win32_VideoController | ForEach-Object { $_.Name }",
+            ],
+            ["wmic", "path", "win32_VideoController", "get", "name"],
+        ]
+
+        for command in commands:
+            output = self._run_probe_command(command)
+            names: list[str] = []
+            for line in output.splitlines():
+                name = line.strip()
+                if not name:
+                    continue
+                lowered = name.lower()
+                if lowered in {"name", "caption"}:
+                    continue
+                if set(name) == {"-"}:
+                    continue
+                names.append(name)
+            if names:
+                return names
+
+        return []
+
+    @staticmethod
+    def _backend_from_gpu_name(name: str) -> str | None:
+        lowered = name.lower()
+        if any(token in lowered for token in ("nvidia", "geforce", "quadro", "tesla")):
+            return "cuda"
+        if any(token in lowered for token in ("amd", "radeon", "ati")):
+            # HIP on Windows requires ROCm kernel driver support that is only
+            # available for RDNA3+ (RX 7xxx) with the AMD HIP SDK.  RDNA2 and
+            # earlier are unsupported on Windows ROCm, so always use Vulkan.
+            if os.name == "nt":
+                return "vulkan"
+            return "hip"
+        if "intel" in lowered:
+            return "vulkan"
+        return None
+
+    def _append_detected_device(
+        self,
+        devices: list[GPUDevice],
+        seen_keys: set[str],
+        seen_names: set[str],
+        backend: str,
+        gpu_id: str,
+        gpu_name: str,
+        device_name: str | None = None,
+    ) -> None:
+        key = f"{backend}:{gpu_id}"
+        normalized_name = self._normalize_sakura_gpu_name(gpu_name)
+        if key in seen_keys or normalized_name in seen_names:
+            return
+
+        label_prefix = backend.upper() if backend != "vulkan" else "Vulkan"
+        devices.append(
+            GPUDevice(
+                key=key,
+                label=f"{label_prefix} GPU {gpu_id}: {gpu_name}",
+                backend=backend,
+                env_id=gpu_id,
+                device_name=device_name or self._backend_device_name(backend, gpu_id),
+            )
+        )
+        seen_keys.add(key)
+        seen_names.add(normalized_name)
+
     def _detect_available_devices(self) -> list[GPUDevice]:
-        devices: list[GPUDevice] = [GPUDevice(key="cpu", label="CPU", backend="cpu", env_id="")]
-        seen = {"cpu"}
+        devices: list[GPUDevice] = [GPUDevice(key="cpu", label="CPU", backend="cpu", env_id="", device_name="CPU")]
+        seen_keys = {"cpu"}
+        seen_names: set[str] = set()
 
         nvidia_output = self._run_probe_command([
             "nvidia-smi",
@@ -3232,11 +3415,7 @@ class MainWindow(QMainWindow):
                 continue
             gpu_id = parts[0]
             gpu_name = parts[1] if len(parts) > 1 else f"NVIDIA GPU {gpu_id}"
-            key = f"cuda:{gpu_id}"
-            if key in seen:
-                continue
-            devices.append(GPUDevice(key=key, label=f"CUDA GPU {gpu_id}: {gpu_name}", backend="cuda", env_id=gpu_id))
-            seen.add(key)
+            self._append_detected_device(devices, seen_keys, seen_names, "cuda", gpu_id, gpu_name)
 
         rocm_output = self._run_probe_command(["rocm-smi", "--showproductname"])
         for line in rocm_output.splitlines():
@@ -3245,24 +3424,37 @@ class MainWindow(QMainWindow):
                 continue
             gpu_id = match.group(1)
             gpu_name = match.group(2).strip()
-            key = f"hip:{gpu_id}"
-            if key in seen:
-                continue
-            devices.append(GPUDevice(key=key, label=f"HIP GPU {gpu_id}: {gpu_name}", backend="hip", env_id=gpu_id))
-            seen.add(key)
+            self._append_detected_device(devices, seen_keys, seen_names, "hip", gpu_id, gpu_name)
 
-        vulkan_output = self._run_probe_command(["vulkaninfo", "--summary"])
-        for line in vulkan_output.splitlines():
-            match = re.search(r"GPU(\d+)\s*:\s*(.+)", line)
-            if not match:
-                continue
-            gpu_id = match.group(1)
-            gpu_name = match.group(2).strip()
-            key = f"vulkan:{gpu_id}"
-            if key in seen:
-                continue
-            devices.append(GPUDevice(key=key, label=f"Vulkan GPU {gpu_id}: {gpu_name}", backend="vulkan", env_id=gpu_id))
-            seen.add(key)
+        vulkan_devices = self._probe_llama_server_devices("vulkan")
+        if vulkan_devices:
+            for device in vulkan_devices:
+                self._append_detected_device(
+                    devices,
+                    seen_keys,
+                    seen_names,
+                    device.backend,
+                    device.env_id,
+                    device.label.split(":", 1)[1].strip() if ":" in device.label else device.label,
+                    device.device_name,
+                )
+        else:
+            vulkan_output = self._run_probe_command(["vulkaninfo", "--summary"])
+            for line in vulkan_output.splitlines():
+                match = re.search(r"GPU\s*(\d+)\s*[:\-]\s*(.+)", line, re.IGNORECASE)
+                if not match:
+                    continue
+                gpu_id = match.group(1)
+                gpu_name = match.group(2).strip()
+                self._append_detected_device(devices, seen_keys, seen_names, "vulkan", gpu_id, gpu_name)
+
+            if os.name == "nt":
+                for gpu_name in self._probe_windows_video_controllers():
+                    backend = self._backend_from_gpu_name(gpu_name)
+                    if backend is None:
+                        continue
+                    backend_count = sum(1 for device in devices if device.backend == backend)
+                    self._append_detected_device(devices, seen_keys, seen_names, backend, str(backend_count), gpu_name)
 
         return devices
 
@@ -3288,6 +3480,27 @@ class MainWindow(QMainWindow):
 
         if not any(checkbox.isChecked() for checkbox in slot.device_checkboxes.values()) and "cpu" in slot.device_checkboxes:
             slot.device_checkboxes["cpu"].setChecked(True)
+        self._update_slot_device_diagnostics(slot)
+
+    @staticmethod
+    def _normalize_loaded_device_key(device_key: str) -> str:
+        # On Windows AMD is always Vulkan; migrate any stale hip: key.
+        if os.name == "nt" and device_key.startswith("hip:"):
+            return f"vulkan:{device_key.split(':', 1)[1]}"
+        return device_key
+
+    def _repair_loaded_device_keys(self, selected_keys: list[str]) -> list[str]:
+        available_by_key = {device.key: device for device in self.available_devices}
+        repaired: list[str] = []
+
+        for key in selected_keys:
+            if key in available_by_key:
+                repaired.append(key)
+
+        if not repaired and any(device.key == "cpu" for device in self.available_devices):
+            repaired.append("cpu")
+
+        return repaired
 
     def _load_config(self) -> None:
         if not CONFIG_PATH.exists():
@@ -3382,17 +3595,26 @@ class MainWindow(QMainWindow):
 
             selected_device_keys = server_data.get("device_keys")
             if isinstance(selected_device_keys, list):
-                normalized_keys = [str(item) for item in selected_device_keys if isinstance(item, str)]
+                normalized_keys = [
+                    self._normalize_loaded_device_key(str(item))
+                    for item in selected_device_keys
+                    if isinstance(item, str)
+                ]
             else:
                 legacy_backend = str(server_data.get("backend", "cpu") or "cpu").strip().lower()
                 legacy_gpu_text = str(server_data.get("gpu_assignment", "") or "")
                 if legacy_gpu_text:
                     ids = [segment.strip() for segment in legacy_gpu_text.split(",") if segment.strip()]
-                    normalized_keys = [f"{legacy_backend}:{gpu_id}" for gpu_id in ids]
+                    normalized_keys = [
+                        self._normalize_loaded_device_key(f"{legacy_backend}:{gpu_id}")
+                        for gpu_id in ids
+                    ]
                 elif legacy_backend == "cpu":
                     normalized_keys = ["cpu"]
                 else:
                     normalized_keys = []
+
+            normalized_keys = self._repair_loaded_device_keys(normalized_keys)
 
             self._render_slot_device_checkboxes(slot, normalized_keys)
             split_mode = str(server_data.get("split_mode", "parallel") or "parallel")
@@ -4308,12 +4530,8 @@ class MainWindow(QMainWindow):
     # ── Refresh / list local models ───────────────────────────────────
 
     def _ollama_refresh_models(self) -> None:
-        """Populate the local Ollama models table via `ollama list`."""
-        ollama_exe = shutil.which("ollama")
-        if not ollama_exe:
-            self.ollama_extract_status.setText("'ollama' not found on PATH.")
-            return
-
+        """Populate the local Ollama models table via `ollama list` or manifest scan."""
+        ollama_exe = shutil.which("ollama")  # may be None — manifest scan is the fallback
         self.ollama_refresh_button.setEnabled(False)
         self.ollama_extract_status.setText("Loading model list…")
 
@@ -4323,38 +4541,78 @@ class MainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     @staticmethod
-    def _ollama_list_worker(ollama_exe: str) -> list[dict[str, str]]:
-        result = subprocess.run(
-            [ollama_exe, "list"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "ollama list failed")
+    def _ollama_list_worker(ollama_exe: str | None) -> list[dict[str, str]]:
+        if ollama_exe:
+            result = subprocess.run(
+                [ollama_exe, "list"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if result.returncode == 0:
+                lines = result.stdout.strip().splitlines()
+                models: list[dict[str, str]] = []
+                # First line is header: NAME  ID  SIZE  MODIFIED
+                for line in lines[1:]:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    name = parts[0]
+                    model_id = parts[1]
+                    size_str = f"{parts[2]} {parts[3]}" if len(parts) > 3 else (parts[2] if len(parts) > 2 else "")
+                    modified = " ".join(parts[4:]) if len(parts) > 4 else ""
+                    models.append({"name": name, "id": model_id, "size": size_str, "modified": modified})
+                if models:
+                    return models
+        # Fallback: scan manifest files directly (works without ollama on PATH)
+        return MainWindow._scan_ollama_manifests()
 
-        lines = result.stdout.strip().splitlines()
-        if not lines:
-            return []
-
-        # First line is header: NAME  ID  SIZE  MODIFIED
+    @staticmethod
+    def _scan_ollama_manifests() -> list[dict[str, str]]:
+        """List locally available Ollama models by walking the manifests directory."""
         models: list[dict[str, str]] = []
-        for line in lines[1:]:
-            parts = line.split()
-            if len(parts) < 4:
+        if not OLLAMA_MANIFESTS_DIR.is_dir():
+            return models
+        for manifest_path in sorted(OLLAMA_MANIFESTS_DIR.rglob("*")):
+            if not manifest_path.is_file():
                 continue
-            name = parts[0]
-            model_id = parts[1]
-            # Size is typically "4.9 GB" (two tokens)
-            size_str = f"{parts[2]} {parts[3]}" if len(parts) > 3 else parts[2]
-            modified = " ".join(parts[4:]) if len(parts) > 4 else ""
-            models.append({
-                "name": name,
-                "id": model_id,
-                "size": size_str,
-                "modified": modified,
-            })
+            try:
+                with manifest_path.open(encoding="utf-8") as f:
+                    manifest = json.load(f)
+            except Exception:  # noqa: BLE001
+                continue
+            if "layers" not in manifest:
+                continue
+            rel = manifest_path.relative_to(OLLAMA_MANIFESTS_DIR)
+            parts = rel.parts
+            if len(parts) < 3:
+                continue
+            tag = parts[-1]
+            model = parts[-2]
+            namespace = parts[-3] if len(parts) > 3 else ""
+            if namespace in ("library", "", "registry.ollama.ai"):
+                display_name = f"{model}:{tag}"
+            else:
+                display_name = f"{namespace}/{model}:{tag}"
+            total_size = sum(
+                layer.get("size", 0)
+                for layer in manifest.get("layers", [])
+                if layer.get("mediaType") == "application/vnd.ollama.image.model"
+            )
+            if total_size >= 1024 ** 3:
+                size_str = f"{total_size / 1024 ** 3:.1f} GB"
+            elif total_size >= 1024 ** 2:
+                size_str = f"{total_size / 1024 ** 2:.0f} MB"
+            elif total_size > 0:
+                size_str = f"{total_size / 1024:.0f} KB"
+            else:
+                size_str = "unknown"
+            config = manifest.get("config", {})
+            raw_digest = config.get("digest", "")
+            model_id = raw_digest[7:19] if raw_digest.startswith("sha256:") else raw_digest[:12]
+            modified = datetime.fromtimestamp(manifest_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            models.append({"name": display_name, "id": model_id, "size": size_str, "modified": modified})
         return models
 
     def _on_ollama_list_complete(self, models: list[dict[str, str]]) -> None:
@@ -4383,13 +4641,11 @@ class MainWindow(QMainWindow):
             return
 
         model_name = self.ollama_models_table.item(row, 0).text()
+        # ollama CLI is optional — manifest-based extraction works without it
         ollama_exe = shutil.which("ollama")
-        if not ollama_exe:
-            QMessageBox.critical(self, "Ollama Not Found", "'ollama' not found on PATH.")
-            return
 
         self.ollama_extract_button.setEnabled(False)
-        self.ollama_extract_status.setText(f"Resolving blob hash for {model_name}…")
+        self.ollama_extract_status.setText(f"Resolving blob for {model_name}…")
 
         worker = Worker(self._ollama_extract_worker, ollama_exe, model_name)
         worker.signals.finished.connect(self._on_ollama_extract_complete)
@@ -4397,8 +4653,91 @@ class MainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     @staticmethod
-    def _ollama_extract_worker(ollama_exe: str, model_name: str) -> dict[str, str]:
-        """Resolve blob hash via `ollama show --modelfile`, find blob, copy to models/."""
+    def _resolve_ollama_manifest_path(model_name: str) -> Path | None:
+        """Map an Ollama model name like 'llama3:8b' to its local manifest file."""
+        name, _, tag = model_name.rpartition(":")
+        if not name:
+            name, tag = model_name, "latest"
+        tag = tag or "latest"
+        parts = name.split("/", 1)
+        namespace, model = ("library", parts[0]) if len(parts) == 1 else (parts[0], parts[1])
+        candidate = OLLAMA_MANIFESTS_DIR / "registry.ollama.ai" / namespace / model / tag
+        if candidate.is_file():
+            return candidate
+        # Fuzzy walk for non-standard registry prefixes
+        if OLLAMA_MANIFESTS_DIR.is_dir():
+            for path in OLLAMA_MANIFESTS_DIR.rglob(tag):
+                if path.is_file() and path.parent.name == model:
+                    return path
+        return None
+
+    @staticmethod
+    def _extract_via_manifest(model_name: str, manifest_path: Path) -> dict[str, str]:
+        """Read an Ollama manifest JSON and copy/concatenate model blobs into models/."""
+        with manifest_path.open(encoding="utf-8") as f:
+            manifest = json.load(f)
+        model_layers = [
+            layer for layer in manifest.get("layers", [])
+            if layer.get("mediaType") == "application/vnd.ollama.image.model"
+        ]
+        if not model_layers:
+            raise RuntimeError(
+                f"No 'application/vnd.ollama.image.model' layer found in the manifest "
+                f"for '{model_name}'.\nManifest: {manifest_path}"
+            )
+        blob_paths: list[Path] = []
+        for layer in model_layers:
+            digest = layer.get("digest", "")
+            blob_name = digest.replace(":", "-")  # sha256:abc… → sha256-abc…
+            blob_path = OLLAMA_BLOBS_DIR / blob_name
+            if not blob_path.exists():
+                raise RuntimeError(
+                    f"Blob not found: {blob_path}\n"
+                    f"Blobs dir: {OLLAMA_BLOBS_DIR}\n\n"
+                    f"If your OLLAMA_MODELS env var points elsewhere, set it before launching."
+                )
+            blob_paths.append(blob_path)
+        safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", model_name)
+        dest = MODELS_DIR / f"{safe_name}.gguf"
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            stem = dest.stem
+            for i in range(1, 100):
+                candidate = MODELS_DIR / f"{stem}_{i}.gguf"
+                if not candidate.exists():
+                    dest = candidate
+                    break
+        if len(blob_paths) == 1:
+            shutil.copy2(blob_paths[0], dest)
+        else:
+            with dest.open("wb") as out_f:
+                for bp in blob_paths:
+                    with bp.open("rb") as in_f:
+                        shutil.copyfileobj(in_f, out_f)
+        return {"model_name": model_name, "path": str(dest.resolve()), "size": dest.stat().st_size}
+
+    @staticmethod
+    def _ollama_extract_worker(ollama_exe: str | None, model_name: str) -> dict[str, str]:
+        """Extract GGUF blobs for an Ollama model.
+
+        Primary path: read the manifest JSON, find all
+        'application/vnd.ollama.image.model' layers, and copy/concatenate their
+        blobs.  This handles split models and works without the ollama CLI.
+
+        Fallback: parse `ollama show --modelfile` for the FROM blob hash (legacy
+        single-blob approach for locally-created models).
+        """
+        # ── Primary: manifest-based extraction ──────────────────────────────
+        manifest_path = MainWindow._resolve_ollama_manifest_path(model_name)
+        if manifest_path is not None:
+            return MainWindow._extract_via_manifest(model_name, manifest_path)
+
+        # ── Fallback: ollama show --modelfile ────────────────────────────────
+        if not ollama_exe:
+            raise RuntimeError(
+                f"No manifest file found for '{model_name}' and 'ollama' is not on PATH.\n\n"
+                f"Manifests dir checked: {OLLAMA_MANIFESTS_DIR}"
+            )
         result = subprocess.run(
             [ollama_exe, "show", model_name, "--modelfile"],
             capture_output=True,
@@ -4410,8 +4749,6 @@ class MainWindow(QMainWindow):
             raise RuntimeError(
                 f"ollama show failed:\n{result.stderr.strip() or result.stdout.strip()}"
             )
-
-        # Parse the FROM line to get either a direct blob path or a blob hash
         blob_hash = None
         blob_path: Path | None = None
         for line in result.stdout.splitlines():
@@ -4419,48 +4756,22 @@ class MainWindow(QMainWindow):
             if line.upper().startswith("FROM"):
                 value = line.split(None, 1)[-1].strip().strip('"')
                 candidate_path = Path(value)
-
-                # Value may already be a full blob path, e.g.
-                # C:\Users\...\.ollama\models\blobs\sha256-...
-                if candidate_path.is_absolute() or candidate_path.exists():
+                if candidate_path.is_absolute() and candidate_path.exists():
                     blob_path = candidate_path
                     break
-
-                # Otherwise it may be a blob reference like sha256:abc123...
                 if value.lower().startswith("sha256:") or value.lower().startswith("sha256-"):
                     blob_hash = value.replace(":", "-")
                     break
-
-        if not blob_hash and blob_path is None:
-            raise RuntimeError(
-                f"Could not find a FROM sha256:… line in modelfile for '{model_name}'.\n\n"
-                f"Output:\n{result.stdout[:500]}"
-            )
-
-        # Locate the actual blob file
-        if blob_path is None:
+        if blob_hash and blob_path is None:
             blob_path = OLLAMA_BLOBS_DIR / blob_hash
-            if not blob_path.exists():
-                # Try with sha256- prefix format
-                alt = blob_hash.replace("sha256-", "sha256:")
-                alt_path = OLLAMA_BLOBS_DIR / alt
-                if alt_path.exists():
-                    blob_path = alt_path
-
-        if not blob_path.exists():
+        if blob_path is None or not blob_path.exists():
             raise RuntimeError(
-                f"Blob file not found.\n\n"
-                f"Looked for: {blob_path}\n"
-                f"Blobs dir: {OLLAMA_BLOBS_DIR}\n\n"
-                f"If your OLLAMA_MODELS env var points elsewhere, set it before launching."
+                f"Could not resolve a blob path for '{model_name}'.\n\n"
+                f"modelfile output:\n{result.stdout[:500]}"
             )
-
-        # Copy to models/ with a .gguf name
         safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", model_name)
         dest = MODELS_DIR / f"{safe_name}.gguf"
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
-
-        # If file already exists, add a suffix
         if dest.exists():
             stem = dest.stem
             for i in range(1, 100):
@@ -4468,7 +4779,6 @@ class MainWindow(QMainWindow):
                 if not candidate.exists():
                     dest = candidate
                     break
-
         shutil.copy2(blob_path, dest)
         return {"model_name": model_name, "path": str(dest.resolve()), "size": blob_path.stat().st_size}
 
@@ -4746,9 +5056,43 @@ class MainWindow(QMainWindow):
             return None
         return next(iter(backends))
 
+    @staticmethod
+    def _extra_args_contains_option(extra_args: str, option: str) -> bool:
+        try:
+            tokens = shlex.split(extra_args, posix=False)
+        except ValueError:
+            tokens = extra_args.split()
+
+        for token in tokens:
+            if token == option or token.startswith(f"{option}="):
+                return True
+        return False
+
+    @staticmethod
+    def _runtime_path_matches_backend(path: str, backend: str) -> bool:
+        lowered_path = path.lower()
+        backend_key = backend.strip().lower()
+        backend_tokens = {
+            "cuda": ("cuda",),
+            "hip": ("hip", "rocm"),
+            "vulkan": ("vulkan",),
+            "cpu": ("cpu",),
+        }
+        expected_tokens = backend_tokens.get(backend_key, ())
+        if expected_tokens and any(token in lowered_path for token in expected_tokens):
+            return True
+
+        conflicting_tokens = {
+            "cuda": ("hip", "rocm", "vulkan", "cpu"),
+            "hip": ("cuda", "vulkan", "cpu"),
+            "vulkan": ("cuda", "hip", "rocm", "cpu"),
+            "cpu": ("cuda", "hip", "rocm", "vulkan"),
+        }
+        return not any(token in lowered_path for token in conflicting_tokens.get(backend_key, ()))
+
     def _resolve_llama_server_for_backend(self, backend: str) -> str:
         configured = self._llama_path_input_for_backend(backend).text().strip()
-        if configured and Path(configured).exists():
+        if configured and Path(configured).exists() and self._runtime_path_matches_backend(configured, backend):
             return configured
 
         detected = self._auto_detect_llama_server(backend)
@@ -4815,6 +5159,7 @@ class MainWindow(QMainWindow):
     def _update_backend_label(self, slot: ServerSlot) -> None:
         backend = self._infer_backend(self._selected_devices(slot))
         slot.backend_label.setText(backend.upper() if backend else "Invalid")
+        self._update_slot_device_diagnostics(slot)
 
     def start_server(self, index: int) -> None:
         slot = self.server_slots[index]
@@ -4835,6 +5180,11 @@ class MainWindow(QMainWindow):
         llama_path = self._resolve_llama_server_for_backend(backend)
         model_path = slot.model_path_input.text().strip()
         host = slot.host_input.text().strip() or "127.0.0.1"
+        selected_device_names = [
+            device.device_name or self._backend_device_name(device.backend, device.env_id)
+            for device in selected_devices
+            if device.backend == backend and device.env_id
+        ]
 
         if not llama_path or not Path(llama_path).exists():
             QMessageBox.warning(
@@ -4859,11 +5209,11 @@ class MainWindow(QMainWindow):
             str(slot.ctx_size_input.value()),
         ]
 
-        gpu_ids = [device.env_id for device in selected_devices if device.backend == backend and device.env_id]
-        if gpu_ids:
+        extra_args = slot.extra_args_input.text().strip()
+        if selected_device_names and not self._extra_args_contains_option(extra_args, "--n-gpu-layers"):
             arguments.extend(["--n-gpu-layers", "999"])
-        if len(gpu_ids) > 1 and slot.split_mode_input.currentText() == "pooled":
-            arguments.extend(["--main-gpu", "0", "--tensor-split", ",".join(["1"] * len(gpu_ids))])
+        if len(selected_device_names) > 1 and slot.split_mode_input.currentText() == "pooled":
+            arguments.extend(["--main-gpu", "0", "--tensor-split", ",".join(["1"] * len(selected_device_names))])
 
         cache_k = slot.cache_type_k_input.currentText()
         cache_v = slot.cache_type_v_input.currentText()
@@ -4872,31 +5222,29 @@ class MainWindow(QMainWindow):
         if cache_v != "f16":
             arguments.extend(["--cache-type-v", cache_v])
         if slot.flash_attn_checkbox.isChecked():
-            arguments.append("-fa")
+            arguments.extend(["--flash-attn", "on"])
         if slot.no_cache_prompt_checkbox.isChecked():
             arguments.append("--no-cache-prompt")
 
-        extra_args = slot.extra_args_input.text().strip()
         if extra_args:
             arguments.extend(shlex.split(extra_args, posix=False))
 
-        environment = QProcessEnvironment.systemEnvironment()
-        visible_ids = ",".join(gpu_ids)
-        backend_key = backend.lower()
-        if visible_ids:
-            if backend_key == "cuda":
-                environment.insert("CUDA_VISIBLE_DEVICES", visible_ids)
-            elif backend_key == "hip":
-                environment.insert("HIP_VISIBLE_DEVICES", visible_ids)
-                environment.insert("ROCR_VISIBLE_DEVICES", visible_ids)
-            elif backend_key == "vulkan":
-                environment.insert("GGML_VK_VISIBLE_DEVICES", visible_ids)
-                environment.insert("VK_VISIBLE_DEVICES", visible_ids)
+        if selected_device_names:
+            arguments.extend(["--device", ",".join(selected_device_names)])
 
-        slot.process.setProcessEnvironment(environment)
         self._model_compat_warning_shown.discard(index)
         slot.status_label.setText("Starting server…")
         self._save_config()
+        if selected_device_names:
+            self.log_output.appendPlainText(
+                f"[S{index + 1}] exact backend GPU selection: {', '.join(selected_device_names)}"
+            )
+        if backend != "cpu":
+            probe_output = self._run_probe_command([llama_path, "--list-devices"])
+            if probe_output:
+                self.log_output.appendPlainText(f"[S{index + 1}] device order reported by llama-server:")
+                for line in probe_output.splitlines():
+                    self.log_output.appendPlainText(f"[S{index + 1}]   {line}")
         self.log_output.appendPlainText(f"[S{index + 1}] > {llama_path} {' '.join(arguments)}")
         slot.process.start(llama_path, arguments)
 
