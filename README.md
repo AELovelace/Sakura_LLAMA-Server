@@ -63,6 +63,7 @@ python app.py
 - In **Server Settings**, each server slot also has an **Ollama Model** alias used by the compatibility proxy for model routing.
 - For HIP and Vulkan builds, point a server slot to your `hip-llama` or `vulkan-llama` `llama-server` executable (or leave path empty to use simple autodetect paths).
 - Use **Start Ollama Proxy** to expose Ollama-style endpoints on a configurable host/port (default `127.0.0.1:11434`).
+- Use **Start Sakura API** in the **Server Log** tab to expose a raw telemetry endpoint on a configurable host/port (default `127.0.0.1:11435`).
 - Model downloads show live transferred bytes, total size when available, and estimated throughput.
 - The repository panel shows basic metadata such as author, tags, downloads, and license when available.
 - The chat panel is a lightweight tester for any selected server slot, not a full chat client yet.
@@ -80,6 +81,21 @@ Routing behavior:
 
 - `model` (or `name`) is matched to a server slot by that slot's **Ollama Model** alias.
 - If no model is provided or no exact alias matches, requests route to the configured **Ollama default** server.
+
+## Sakura monitor API
+
+The Server Log tab also includes a lightweight GET endpoint for telemetry snapshots:
+
+- `GET /api/sakura/monitor`
+
+The response is raw JSON and is meant for scripts, dashboards, and quick local polling. It includes:
+
+- `updated_at`
+- `system` CPU and RAM stats
+- `gpus` with VRAM, shared memory, utilization, clock, power, temperature, and source metadata
+- `diagnostics` for Python/runtime and telemetry backend counts
+
+The same payload is also available at `GET /api/sakura/status` as an alias.
 
 Device assignment behavior:
 

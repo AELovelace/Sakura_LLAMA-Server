@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import collections
 import json
 import os
 import re
@@ -11,13 +12,13 @@ import threading
 import time
 import zipfile
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import URLError
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import urlretrieve
 
 import requests
@@ -158,6 +159,7 @@ class SakuraGPUStats:
     shared_total_mib: int = 0
     shared_used_mib: int = 0
     shared_percent: float = 0.0
+    sources: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -316,6 +318,7 @@ class SakuraNvidiaMonitor:
                         util_percent=util_percent,
                         power_watts=power_watts,
                         temperature_c=temperature_c,
+                        sources=("nvml",),
                     )
                 )
             except Exception:  # noqa: BLE001
@@ -567,6 +570,7 @@ class SakuraLibreHardwareMonitorBridge:
                         util_percent=util_percent,
                         power_watts=power_watts,
                         temperature_c=temperature_c,
+                        sources=("lhm",),
                     )
                 )
         except Exception:  # noqa: BLE001
@@ -1253,6 +1257,99 @@ class OllamaCompatProxy:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+        return Handler
+
+
+class _LogOutputWidget(QPlainTextEdit):
+    """QPlainTextEdit that mirrors every appended line into a thread-safe ring buffer."""
+
+    def __init__(self, buffer: collections.deque, lock: threading.Lock, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._log_buffer = buffer
+        self._log_lock = lock
+
+    def appendPlainText(self, text: str) -> None:  # noqa: N802
+        super().appendPlainText(text)
+        with self._log_lock:
+            self._log_buffer.append({
+                "ts": datetime.now().isoformat(timespec="milliseconds"),
+                "line": text,
+            })
+
+    def clear(self) -> None:
+        super().clear()
+        with self._log_lock:
+            self._log_buffer.clear()
+
+
+class SakuraMonitorStatusServer:
+    def __init__(
+        self,
+        get_snapshot: Callable[[], dict[str, Any]],
+        get_logs: Callable[[], dict[str, Any]],
+    ) -> None:
+        self._get_snapshot = get_snapshot
+        self._get_logs = get_logs
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        self._host = "127.0.0.1"
+        self._port = 11435
+
+    def is_running(self) -> bool:
+        return self._server is not None and self._thread is not None and self._thread.is_alive()
+
+    def start(self, host: str, port: int) -> None:
+        if self.is_running():
+            raise RuntimeError("Sakura monitor API is already running.")
+
+        self._host = host
+        self._port = port
+        handler_cls = self._build_handler_class()
+        self._server = ThreadingHTTPServer((host, port), handler_cls)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if not self._server:
+            return
+        self._server.shutdown()
+        self._server.server_close()
+        self._server = None
+        self._thread = None
+
+    def listen_url(self) -> str:
+        return f"http://{self._host}:{self._port}/api/sakura/monitor"
+
+    def _build_handler_class(self) -> type[BaseHTTPRequestHandler]:
+        parent = self
+
+        class Handler(BaseHTTPRequestHandler):
+            server_version = "DoLLAMACPP-SakuraMonitor/1.0"
+
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                parsed = urlparse(self.path)
+                if parsed.path in {"/api/sakura/monitor", "/api/sakura/status"}:
+                    self._send_json(200, parent._get_snapshot())
+                    return
+                if parsed.path == "/api/sakura/logs":
+                    params = parse_qs(parsed.query)
+                    raw_limit = params.get("limit", [None])[0]
+                    raw_slot = params.get("slot", [None])[0]
+                    self._send_json(200, parent._get_logs(raw_limit, raw_slot))
+                    return
+                self._send_json(404, {"error": f"Unsupported endpoint: {parsed.path}"})
+
+            def _send_json(self, status_code: int, payload: dict[str, Any]) -> None:
+                data = json.dumps(payload).encode("utf-8")
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
 
         return Handler
 
@@ -2093,8 +2190,18 @@ class MainWindow(QMainWindow):
         self.server_slots: list[ServerSlot] = []
         self.server_running_states = [False, False, False, False]
         self._model_compat_warning_shown: set[int] = set()
+        self._slot_expected_backend: dict[int, str] = {}
+        self._slot_in_device_info_block: set[int] = set()
+        self._slot_seen_accel_device: set[int] = set()
+        self._slot_cuda_fallback_warned: set[int] = set()
         self.sakura_monitor = SakuraNvidiaMonitor()
         self.sakura_lhm = SakuraLibreHardwareMonitorBridge()
+        self._log_buffer: collections.deque = collections.deque(maxlen=2000)
+        self._log_buffer_lock = threading.Lock()
+        self.sakura_monitor_api = SakuraMonitorStatusServer(
+            self._get_sakura_monitor_snapshot,
+            self._get_log_snapshot,
+        )
         self.sakura_expected_runtime = PROJECT_ROOT / ".venv311" / "Scripts" / "python.exe"
         self.sakura_timer = QTimer(self)
         self.sakura_timer.setInterval(1000)
@@ -2124,10 +2231,12 @@ class MainWindow(QMainWindow):
         self._load_config()
         self.refresh_available_devices()
         self._set_ollama_proxy_state(False, "Ollama API proxy is stopped.")
+        self._set_sakura_monitor_api_state(False, "Sakura monitor API is stopped.")
         for slot in self.server_slots:
             self._set_server_state(slot.index, False)
         self._refresh_ollama_snapshot()
         self._update_proxy_port_labels()
+        self._update_sakura_monitor_labels()
 
         # ---- System tray ----
         self._build_tray_icon()
@@ -2432,10 +2541,25 @@ class MainWindow(QMainWindow):
     def _backend_device_name(backend: str, device_id: str) -> str:
         return f"{backend.strip().upper()}{device_id}"
 
+    @staticmethod
+    def _exact_device_name(device: GPUDevice) -> str:
+        return device.device_name.strip() if device.device_name else ""
+
+    def _selected_exact_device_names(self, selected_devices: list[GPUDevice], backend: str) -> list[str]:
+        if backend != "vulkan":
+            return []
+        return [
+            exact_name
+            for device in selected_devices
+            if device.backend == backend and device.env_id
+            for exact_name in [self._exact_device_name(device)]
+            if exact_name
+        ]
+
     def _parse_llama_server_device_output(self, output: str) -> list[GPUDevice]:
         devices: list[GPUDevice] = []
         seen_keys: set[str] = set()
-        seen_names: set[str] = set()
+        seen_name_keys: set[str] = set()
 
         for line in output.splitlines():
             row = line.strip()
@@ -2455,8 +2579,8 @@ class MainWindow(QMainWindow):
             device_id = match.group(2).strip()
             label = match.group(3).strip()
             key = f"{backend}:{device_id}"
-            normalized_name = self._normalize_sakura_gpu_name(label)
-            if key in seen_keys or normalized_name in seen_names:
+            name_key = f"{backend}:{self._normalize_sakura_gpu_name(label)}"
+            if key in seen_keys or name_key in seen_name_keys:
                 continue
 
             devices.append(
@@ -2465,11 +2589,11 @@ class MainWindow(QMainWindow):
                     label=f"{backend.upper()} GPU {device_id}: {label}",
                     backend=backend,
                     env_id=device_id,
-                    device_name=self._backend_device_name(backend, device_id),
+                    device_name=f"Vulkan{device_id}" if backend == "vulkan" else device_id,
                 )
             )
             seen_keys.add(key)
-            seen_names.add(normalized_name)
+            seen_name_keys.add(name_key)
 
         return devices
 
@@ -2491,16 +2615,29 @@ class MainWindow(QMainWindow):
         if not selected_devices:
             return "Force exact backend GPU: CPU only"
 
+        backend = self._infer_backend(selected_devices)
+        if backend in (None, "cpu"):
+            return "Force exact backend GPU: CPU only"
+
+        if backend == "cuda":
+            cuda_ids = [device.env_id for device in selected_devices if device.backend == "cuda" and device.env_id]
+            if cuda_ids:
+                return f"Force CUDA GPUs via CUDA_VISIBLE_DEVICES={','.join(cuda_ids)}"
+
+        exact_names = self._selected_exact_device_names(selected_devices, backend)
+        if exact_names:
+            return f"Force exact backend GPU: {', '.join(exact_names)}"
+
         device_names: list[str] = []
         for device in selected_devices:
             if device.backend == "cpu":
                 return "Force exact backend GPU: CPU only"
-            device_name = device.device_name.strip() if device.device_name else self._backend_device_name(device.backend, device.env_id)
-            device_names.append(device_name)
+            if device.backend == backend and device.env_id:
+                device_names.append(device.label)
 
         if not device_names:
             return "Force exact backend GPU: CPU only"
-        return f"Force exact backend GPU: {', '.join(device_names)}"
+        return f"Force exact backend GPU: unavailable for this {backend.upper()} runtime; using backend default ({', '.join(device_names)})"
 
     def _update_slot_device_diagnostics(self, slot: ServerSlot) -> None:
         slot.gpu_diagnostic_label.setText(self._slot_gpu_diagnostic_text(slot))
@@ -2707,8 +2844,43 @@ class MainWindow(QMainWindow):
         generation_layout.addWidget(self.chat_max_tokens_input, 0, 3)
         chat_layout.addRow("Defaults", self._wrap_layout(generation_layout))
 
+        sakura_api_box = QGroupBox("Sakura Monitor API")
+        sakura_api_layout = QFormLayout(sakura_api_box)
+
+        sakura_api_listen_layout = QGridLayout()
+        self.sakura_monitor_host_input = QLineEdit("127.0.0.1")
+        self.sakura_monitor_port_input = QSpinBox()
+        self.sakura_monitor_port_input.setRange(1, 65535)
+        self.sakura_monitor_port_input.setValue(11435)
+        sakura_api_listen_layout.addWidget(QLabel("Host"), 0, 0)
+        sakura_api_listen_layout.addWidget(self.sakura_monitor_host_input, 0, 1)
+        sakura_api_listen_layout.addWidget(QLabel("Port"), 0, 2)
+        sakura_api_listen_layout.addWidget(self.sakura_monitor_port_input, 0, 3)
+        sakura_api_layout.addRow("Listen", self._wrap_layout(sakura_api_listen_layout))
+
+        sakura_api_controls = QHBoxLayout()
+        self.start_sakura_monitor_button = QPushButton("Start Sakura API")
+        self.start_sakura_monitor_button.clicked.connect(self.start_sakura_monitor_api)
+        self.stop_sakura_monitor_button = QPushButton("Stop Sakura API")
+        self.stop_sakura_monitor_button.clicked.connect(self.stop_sakura_monitor_api)
+        self.stop_sakura_monitor_button.setEnabled(False)
+        sakura_api_controls.addWidget(self.start_sakura_monitor_button)
+        sakura_api_controls.addWidget(self.stop_sakura_monitor_button)
+        sakura_api_layout.addRow("API Control", self._wrap_layout(sakura_api_controls))
+
+        self.sakura_monitor_status_label = QLabel("Sakura monitor API is stopped.")
+        self.sakura_monitor_endpoint_label = QLabel("Endpoint: http://127.0.0.1:11435/api/sakura/monitor")
+        self.sakura_monitor_endpoint_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        sakura_api_layout.addRow("Status", self.sakura_monitor_status_label)
+        sakura_api_layout.addRow("URL", self.sakura_monitor_endpoint_label)
+
+        self.sakura_monitor_host_input.textChanged.connect(self._update_sakura_monitor_labels)
+        self.sakura_monitor_host_input.editingFinished.connect(self._save_config)
+        self.sakura_monitor_port_input.valueChanged.connect(self._update_sakura_monitor_labels)
+
         layout.addWidget(hf_box)
         layout.addWidget(ollama_box)
+        layout.addWidget(sakura_api_box)
         layout.addWidget(chat_box)
         layout.addStretch(1)
         return container
@@ -2756,7 +2928,7 @@ class MainWindow(QMainWindow):
         split_mode_input.addItems(["parallel", "pooled"])
         form.addRow("Multi-GPU Mode", split_mode_input)
 
-        kv_cache_types = ["f16", "q8_0", "q4_0", "q4_1"]
+        kv_cache_types = ["f16", "q8_0", "q6_K", "q4_0", "q4_1"]
         cache_type_k_input = QComboBox()
         cache_type_k_input.addItems(kv_cache_types)
         cache_type_v_input = QComboBox()
@@ -3039,7 +3211,7 @@ class MainWindow(QMainWindow):
 
         log_box = QGroupBox("Server Log")
         log_layout = QVBoxLayout(log_box)
-        self.log_output = QPlainTextEdit()
+        self.log_output = _LogOutputWidget(self._log_buffer, self._log_buffer_lock)
         self.log_output.setReadOnly(True)
         self.clear_log_button = QPushButton("Clear Log")
         self.clear_log_button.clicked.connect(self.log_output.clear)
@@ -3103,6 +3275,12 @@ class MainWindow(QMainWindow):
         lhm_matched: set[int] = set()
 
         def apply_missing_fields(target: SakuraGPUStats, source: SakuraGPUStats) -> None:
+            target_sources = list(target.sources)
+            for source_name in source.sources:
+                if source_name not in target_sources:
+                    target_sources.append(source_name)
+            if target_sources:
+                target.sources = tuple(target_sources)
             if target.vram_total_mib <= 0 and source.vram_total_mib > 0:
                 target.vram_total_mib = source.vram_total_mib
                 target.vram_used_mib = source.vram_used_mib
@@ -3177,6 +3355,94 @@ class MainWindow(QMainWindow):
             ram_power_watts=ram_power_watts,
             ram_temp_c=ram_temp_c,
         )
+
+    @staticmethod
+    def _serialize_sakura_system_stats(system_stats: SakuraSystemStats) -> dict[str, Any]:
+        return {
+            "cpu_percent": system_stats.cpu_percent,
+            "cpu_power_watts": system_stats.cpu_power_watts,
+            "cpu_temp_c": system_stats.cpu_temp_c,
+            "ram_total_gib": system_stats.ram_total_gib,
+            "ram_used_gib": system_stats.ram_used_gib,
+            "ram_percent": system_stats.ram_percent,
+            "ram_power_watts": system_stats.ram_power_watts,
+            "ram_temp_c": system_stats.ram_temp_c,
+        }
+
+    @staticmethod
+    def _serialize_sakura_gpu_stats(gpu_stats: SakuraGPUStats) -> dict[str, Any]:
+        return {
+            "name": gpu_stats.name,
+            "vram_total_mib": gpu_stats.vram_total_mib,
+            "vram_used_mib": gpu_stats.vram_used_mib,
+            "vram_percent": gpu_stats.vram_percent,
+            "shared_total_mib": gpu_stats.shared_total_mib,
+            "shared_used_mib": gpu_stats.shared_used_mib,
+            "shared_percent": gpu_stats.shared_percent,
+            "core_clock_mhz": gpu_stats.core_clock_mhz,
+            "util_percent": gpu_stats.util_percent,
+            "power_watts": gpu_stats.power_watts,
+            "temperature_c": gpu_stats.temperature_c,
+            "sources": list(gpu_stats.sources),
+        }
+
+    def _get_log_snapshot(
+        self,
+        raw_limit: str | None = None,
+        raw_slot: str | None = None,
+    ) -> dict[str, Any]:
+        max_limit = 100
+        with self._log_buffer_lock:
+            lines: list[dict[str, Any]] = list(self._log_buffer)
+
+        if raw_slot is not None:
+            try:
+                slot_index = int(raw_slot)
+            except ValueError:
+                slot_index = None
+            if slot_index is not None:
+                prefix = f"[S{slot_index}]"
+                lines = [entry for entry in lines if entry["line"].startswith(prefix)]
+
+        total_available = len(lines)
+
+        limit = max_limit
+        if raw_limit is not None:
+            try:
+                limit = max(1, min(max_limit, int(raw_limit)))
+            except ValueError:
+                limit = max_limit
+
+        lines = lines[-limit:]
+
+        return {
+            "total_available": total_available,
+            "returned": len(lines),
+            "limit": limit,
+            "lines": lines,
+        }
+
+    def _get_sakura_monitor_snapshot(self) -> dict[str, Any]:
+        system_stats = self._collect_sakura_system_stats()
+        gpu_stats, nvml_count, lhm_count = self._collect_sakura_gpu_sources()
+        return {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "system": self._serialize_sakura_system_stats(system_stats),
+            "gpus": [self._serialize_sakura_gpu_stats(stats) for stats in gpu_stats],
+            "diagnostics": {
+                "python_version": sys.version.split()[0],
+                "python_executable": Path(sys.executable).name,
+                "expected_runtime": (
+                    "OK"
+                    if self.sakura_expected_runtime.exists()
+                    and Path(sys.executable).resolve() == self.sakura_expected_runtime.resolve()
+                    else ("Fallback" if self.sakura_expected_runtime.exists() else "Current")
+                ),
+                "nvml_gpu_count": nvml_count,
+                "lhm_gpu_count": lhm_count,
+                "lhm_status": self.sakura_lhm.status,
+            },
+        }
 
     def _rebuild_sakura_gpu_cards(self, gpu_stats: list[SakuraGPUStats]) -> None:
         for card in self.sakura_gpu_cards:
@@ -3253,6 +3519,59 @@ class MainWindow(QMainWindow):
         self.sakura_updated_label.setText(
             f"Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
+
+    def _sakura_monitor_host(self) -> str:
+        if not hasattr(self, "sakura_monitor_host_input"):
+            return "127.0.0.1"
+        return self.sakura_monitor_host_input.text().strip() or "127.0.0.1"
+
+    def _sakura_monitor_url(self) -> str:
+        if not hasattr(self, "sakura_monitor_port_input"):
+            return "http://127.0.0.1:11435/api/sakura/monitor"
+        return f"http://{self._sakura_monitor_host()}:{self.sakura_monitor_port_input.value()}/api/sakura/monitor"
+
+    def _set_sakura_monitor_api_state(self, running: bool, status_message: str) -> None:
+        if hasattr(self, "start_sakura_monitor_button"):
+            self.start_sakura_monitor_button.setEnabled(not running)
+        if hasattr(self, "stop_sakura_monitor_button"):
+            self.stop_sakura_monitor_button.setEnabled(running)
+        if hasattr(self, "sakura_monitor_status_label"):
+            self.sakura_monitor_status_label.setText(status_message)
+
+    def _update_sakura_monitor_labels(self) -> None:
+        if hasattr(self, "sakura_monitor_api"):
+            if self.sakura_monitor_api.is_running():
+                if hasattr(self, "sakura_monitor_endpoint_label"):
+                    self.sakura_monitor_endpoint_label.setText(f"Endpoint: {self.sakura_monitor_api.listen_url()}")
+                self._set_sakura_monitor_api_state(True, f"Running at {self.sakura_monitor_api.listen_url()}")
+            else:
+                if hasattr(self, "sakura_monitor_endpoint_label"):
+                    self.sakura_monitor_endpoint_label.setText(f"Endpoint: {self._sakura_monitor_url()}")
+                self._set_sakura_monitor_api_state(False, "Sakura monitor API is stopped.")
+
+    def start_sakura_monitor_api(self) -> None:
+        host = self._sakura_monitor_host()
+        port = self.sakura_monitor_port_input.value()
+        self._save_config()
+
+        try:
+            self.sakura_monitor_api.start(host, port)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Sakura Monitor API Failed", str(exc) or "API failed to start.")
+            self._set_sakura_monitor_api_state(False, "Sakura monitor API failed to start.")
+            self._update_sakura_monitor_labels()
+            return
+
+        self.log_output.appendPlainText(f"[SAKURA] monitor API at http://{host}:{port}/api/sakura/monitor")
+        self._set_sakura_monitor_api_state(True, f"Running at {self.sakura_monitor_api.listen_url()}")
+        self._update_sakura_monitor_labels()
+
+    def stop_sakura_monitor_api(self) -> None:
+        self.sakura_monitor_api.stop()
+        self._set_sakura_monitor_api_state(False, "Sakura monitor API is stopped.")
+        if hasattr(self, "log_output"):
+            self.log_output.appendPlainText("[SAKURA] monitor API stopped")
+        self._update_sakura_monitor_labels()
 
     def _build_chat_panel(self) -> QWidget:
         box = QGroupBox("Chat Tester")
@@ -3372,15 +3691,15 @@ class MainWindow(QMainWindow):
         self,
         devices: list[GPUDevice],
         seen_keys: set[str],
-        seen_names: set[str],
+        seen_name_keys: set[str],
         backend: str,
         gpu_id: str,
         gpu_name: str,
         device_name: str | None = None,
     ) -> None:
         key = f"{backend}:{gpu_id}"
-        normalized_name = self._normalize_sakura_gpu_name(gpu_name)
-        if key in seen_keys or normalized_name in seen_names:
+        name_key = f"{backend}:{self._normalize_sakura_gpu_name(gpu_name)}"
+        if key in seen_keys or name_key in seen_name_keys:
             return
 
         label_prefix = backend.upper() if backend != "vulkan" else "Vulkan"
@@ -3390,16 +3709,16 @@ class MainWindow(QMainWindow):
                 label=f"{label_prefix} GPU {gpu_id}: {gpu_name}",
                 backend=backend,
                 env_id=gpu_id,
-                device_name=device_name or self._backend_device_name(backend, gpu_id),
+                device_name=device_name or (f"Vulkan{gpu_id}" if backend == "vulkan" else gpu_id),
             )
         )
         seen_keys.add(key)
-        seen_names.add(normalized_name)
+        seen_name_keys.add(name_key)
 
     def _detect_available_devices(self) -> list[GPUDevice]:
         devices: list[GPUDevice] = [GPUDevice(key="cpu", label="CPU", backend="cpu", env_id="", device_name="CPU")]
         seen_keys = {"cpu"}
-        seen_names: set[str] = set()
+        seen_name_keys: set[str] = set()
 
         nvidia_output = self._run_probe_command([
             "nvidia-smi",
@@ -3415,16 +3734,29 @@ class MainWindow(QMainWindow):
                 continue
             gpu_id = parts[0]
             gpu_name = parts[1] if len(parts) > 1 else f"NVIDIA GPU {gpu_id}"
-            self._append_detected_device(devices, seen_keys, seen_names, "cuda", gpu_id, gpu_name)
+            self._append_detected_device(devices, seen_keys, seen_name_keys, "cuda", gpu_id, gpu_name)
 
-        rocm_output = self._run_probe_command(["rocm-smi", "--showproductname"])
-        for line in rocm_output.splitlines():
-            match = re.search(r"GPU\[(\d+)\].*?:\s*(.+)", line)
-            if not match:
-                continue
-            gpu_id = match.group(1)
-            gpu_name = match.group(2).strip()
-            self._append_detected_device(devices, seen_keys, seen_names, "hip", gpu_id, gpu_name)
+        hip_devices = self._probe_llama_server_devices("hip")
+        if hip_devices:
+            for device in hip_devices:
+                self._append_detected_device(
+                    devices,
+                    seen_keys,
+                    seen_name_keys,
+                    device.backend,
+                    device.env_id,
+                    device.label.split(":", 1)[1].strip() if ":" in device.label else device.label,
+                    device.device_name,
+                )
+        else:
+            rocm_output = self._run_probe_command(["rocm-smi", "--showproductname"])
+            for line in rocm_output.splitlines():
+                match = re.search(r"GPU\[(\d+)\].*?:\s*(.+)", line)
+                if not match:
+                    continue
+                gpu_id = match.group(1)
+                gpu_name = match.group(2).strip()
+                self._append_detected_device(devices, seen_keys, seen_name_keys, "hip", gpu_id, gpu_name)
 
         vulkan_devices = self._probe_llama_server_devices("vulkan")
         if vulkan_devices:
@@ -3432,7 +3764,7 @@ class MainWindow(QMainWindow):
                 self._append_detected_device(
                     devices,
                     seen_keys,
-                    seen_names,
+                    seen_name_keys,
                     device.backend,
                     device.env_id,
                     device.label.split(":", 1)[1].strip() if ":" in device.label else device.label,
@@ -3446,7 +3778,7 @@ class MainWindow(QMainWindow):
                     continue
                 gpu_id = match.group(1)
                 gpu_name = match.group(2).strip()
-                self._append_detected_device(devices, seen_keys, seen_names, "vulkan", gpu_id, gpu_name)
+                self._append_detected_device(devices, seen_keys, seen_name_keys, "vulkan", gpu_id, gpu_name)
 
             if os.name == "nt":
                 for gpu_name in self._probe_windows_video_controllers():
@@ -3454,12 +3786,17 @@ class MainWindow(QMainWindow):
                     if backend is None:
                         continue
                     backend_count = sum(1 for device in devices if device.backend == backend)
-                    self._append_detected_device(devices, seen_keys, seen_names, backend, str(backend_count), gpu_name)
+                    self._append_detected_device(devices, seen_keys, seen_name_keys, backend, str(backend_count), gpu_name)
+
+        if any(device.backend == "vulkan" for device in devices):
+            # Vulkan is the stable path on this setup; keep GPU selection Vulkan-only.
+            devices = [device for device in devices if device.backend in {"cpu", "vulkan"}]
 
         return devices
 
     def _render_slot_device_checkboxes(self, slot: ServerSlot, selected_keys: list[str] | None = None) -> None:
-        selected = set(selected_keys or [])
+        repaired = self._repair_loaded_device_keys(selected_keys or [])
+        selected = set(repaired)
         layout = slot.device_box.layout()
         if not isinstance(layout, QVBoxLayout):
             layout = QVBoxLayout(slot.device_box)
@@ -3482,11 +3819,29 @@ class MainWindow(QMainWindow):
             slot.device_checkboxes["cpu"].setChecked(True)
         self._update_slot_device_diagnostics(slot)
 
-    @staticmethod
-    def _normalize_loaded_device_key(device_key: str) -> str:
+    def _normalize_loaded_device_key(self, device_key: str) -> str:
+        if device_key == "cpu":
+            return device_key
+
+        available_vulkan_keys = [device.key for device in self.available_devices if device.backend == "vulkan"]
+
         # On Windows AMD is always Vulkan; migrate any stale hip: key.
         if os.name == "nt" and device_key.startswith("hip:"):
-            return f"vulkan:{device_key.split(':', 1)[1]}"
+            suffix = device_key.split(":", 1)[1]
+            preferred = f"vulkan:{suffix}"
+            if preferred in available_vulkan_keys:
+                return preferred
+            return available_vulkan_keys[0] if available_vulkan_keys else preferred
+
+        # If Vulkan GPUs are present, force all accelerator keys to Vulkan.
+        if available_vulkan_keys and ":" in device_key:
+            prefix, suffix = device_key.split(":", 1)
+            if prefix in {"cuda", "hip", "rocm", "vulkan"}:
+                preferred = f"vulkan:{suffix}"
+                if preferred in available_vulkan_keys:
+                    return preferred
+                return available_vulkan_keys[0]
+
         return device_key
 
     def _repair_loaded_device_keys(self, selected_keys: list[str]) -> list[str]:
@@ -3496,6 +3851,11 @@ class MainWindow(QMainWindow):
         for key in selected_keys:
             if key in available_by_key:
                 repaired.append(key)
+
+        if not repaired:
+            vulkan_keys = [device.key for device in self.available_devices if device.backend == "vulkan"]
+            if vulkan_keys:
+                repaired.append(vulkan_keys[0])
 
         if not repaired and any(device.key == "cpu" for device in self.available_devices):
             repaired.append("cpu")
@@ -3525,6 +3885,9 @@ class MainWindow(QMainWindow):
         self.ollama_port_input.setValue(int(data.get("ollama_port", 11434) or 11434))
         raw_pnp = data.get("proxy_num_predict", -1)
         self.proxy_num_predict_input.setValue(int(raw_pnp) if raw_pnp is not None else -1)
+
+        self.sakura_monitor_host_input.setText(str(data.get("sakura_monitor_host", "127.0.0.1") or "127.0.0.1"))
+        self.sakura_monitor_port_input.setValue(int(data.get("sakura_monitor_port", 11435) or 11435))
 
         llama_paths = data.get("llama_paths", {})
         if not isinstance(llama_paths, dict):
@@ -3653,6 +4016,8 @@ class MainWindow(QMainWindow):
             "ollama_host": self.ollama_host_input.text().strip() or "127.0.0.1",
             "ollama_port": self.ollama_port_input.value(),
             "proxy_num_predict": self.proxy_num_predict_input.value(),
+            "sakura_monitor_host": self.sakura_monitor_host_input.text().strip() or "127.0.0.1",
+            "sakura_monitor_port": self.sakura_monitor_port_input.value(),
             "llama_paths": {
                 "cuda": self.cuda_llama_path_input.text().strip(),
                 "hip": self.hip_llama_path_input.text().strip(),
@@ -5180,11 +5545,10 @@ class MainWindow(QMainWindow):
         llama_path = self._resolve_llama_server_for_backend(backend)
         model_path = slot.model_path_input.text().strip()
         host = slot.host_input.text().strip() or "127.0.0.1"
-        selected_device_names = [
-            device.device_name or self._backend_device_name(device.backend, device.env_id)
-            for device in selected_devices
-            if device.backend == backend and device.env_id
+        selected_backend_devices = [
+            device for device in selected_devices if device.backend == backend and device.env_id
         ]
+        selected_device_names = self._selected_exact_device_names(selected_devices, backend)
 
         if not llama_path or not Path(llama_path).exists():
             QMessageBox.warning(
@@ -5210,10 +5574,10 @@ class MainWindow(QMainWindow):
         ]
 
         extra_args = slot.extra_args_input.text().strip()
-        if selected_device_names and not self._extra_args_contains_option(extra_args, "--n-gpu-layers"):
+        if selected_backend_devices and not self._extra_args_contains_option(extra_args, "--n-gpu-layers"):
             arguments.extend(["--n-gpu-layers", "999"])
-        if len(selected_device_names) > 1 and slot.split_mode_input.currentText() == "pooled":
-            arguments.extend(["--main-gpu", "0", "--tensor-split", ",".join(["1"] * len(selected_device_names))])
+        if len(selected_backend_devices) > 1 and slot.split_mode_input.currentText() == "pooled":
+            arguments.extend(["--main-gpu", "0", "--tensor-split", ",".join(["1"] * len(selected_backend_devices))])
 
         cache_k = slot.cache_type_k_input.currentText()
         cache_v = slot.cache_type_v_input.currentText()
@@ -5232,19 +5596,49 @@ class MainWindow(QMainWindow):
         if selected_device_names:
             arguments.extend(["--device", ",".join(selected_device_names)])
 
+        process_env = QProcessEnvironment.systemEnvironment()
+        cuda_visible = ""
+        if backend == "cuda" and selected_backend_devices:
+            cuda_visible = ",".join(device.env_id for device in selected_backend_devices)
+            process_env.insert("CUDA_VISIBLE_DEVICES", cuda_visible)
+        slot.process.setProcessEnvironment(process_env)
+
         self._model_compat_warning_shown.discard(index)
+        self._slot_expected_backend[index] = backend
+        self._slot_in_device_info_block.discard(index)
+        self._slot_seen_accel_device.discard(index)
+        self._slot_cuda_fallback_warned.discard(index)
         slot.status_label.setText("Starting server…")
         self._save_config()
         if selected_device_names:
             self.log_output.appendPlainText(
                 f"[S{index + 1}] exact backend GPU selection: {', '.join(selected_device_names)}"
             )
+        elif backend == "cuda" and selected_backend_devices and cuda_visible:
+            self.log_output.appendPlainText(
+                f"[S{index + 1}] CUDA device filter: CUDA_VISIBLE_DEVICES={cuda_visible}"
+            )
+        elif backend != "cpu" and selected_backend_devices:
+            self.log_output.appendPlainText(
+                f"[S{index + 1}] exact backend GPU selection unavailable for {backend.upper()} runtime; launching with backend default device order"
+            )
         if backend != "cpu":
-            probe_output = self._run_probe_command([llama_path, "--list-devices"])
-            if probe_output:
-                self.log_output.appendPlainText(f"[S{index + 1}] device order reported by llama-server:")
-                for line in probe_output.splitlines():
-                    self.log_output.appendPlainText(f"[S{index + 1}]   {line}")
+            if backend == "cuda":
+                nvidia_probe = self._run_probe_command([
+                    "nvidia-smi",
+                    "--query-gpu=index,name",
+                    "--format=csv,noheader",
+                ])
+                if nvidia_probe:
+                    self.log_output.appendPlainText(f"[S{index + 1}] CUDA devices from nvidia-smi:")
+                    for line in nvidia_probe.splitlines():
+                        self.log_output.appendPlainText(f"[S{index + 1}]   {line}")
+            else:
+                probe_output = self._run_probe_command([llama_path, "--list-devices"])
+                if probe_output:
+                    self.log_output.appendPlainText(f"[S{index + 1}] device order reported by llama-server:")
+                    for line in probe_output.splitlines():
+                        self.log_output.appendPlainText(f"[S{index + 1}]   {line}")
         self.log_output.appendPlainText(f"[S{index + 1}] > {llama_path} {' '.join(arguments)}")
         slot.process.start(llama_path, arguments)
 
@@ -5470,6 +5864,34 @@ class MainWindow(QMainWindow):
         for line in lines:
             self.log_output.appendPlainText(f"[S{index + 1}] {line}")
             self._maybe_report_model_compatibility_issue(index, line)
+            self._maybe_report_cuda_cpu_fallback(index, line)
+
+    def _maybe_report_cuda_cpu_fallback(self, index: int, line: str) -> None:
+        if self._slot_expected_backend.get(index) != "cuda":
+            return
+
+        lower = line.lower().strip()
+        if "device_info:" in lower:
+            self._slot_in_device_info_block.add(index)
+            self._slot_seen_accel_device.discard(index)
+            return
+
+        if index in self._slot_in_device_info_block:
+            # Track any accelerator line seen in the device_info section.
+            if " - cuda" in lower or " - gpu" in lower:
+                self._slot_seen_accel_device.add(index)
+
+            # device_info block ends before/at system_info in current llama-server logs.
+            if "system_info:" in lower:
+                self._slot_in_device_info_block.discard(index)
+                if index not in self._slot_seen_accel_device and index not in self._slot_cuda_fallback_warned:
+                    self._slot_cuda_fallback_warned.add(index)
+                    slot = self.server_slots[index]
+                    slot.status_label.setText("Running (CPU fallback detected; see Server Log)")
+                    self.log_output.appendPlainText(
+                        f"[S{index + 1}] warning: CUDA backend selected, but runtime reported only CPU devices. "
+                        "This runtime is not using CUDA on this system."
+                    )
 
     def _maybe_report_model_compatibility_issue(self, index: int, line: str) -> None:
         lower = line.lower()
@@ -5535,6 +5957,11 @@ class MainWindow(QMainWindow):
 
     def _set_server_state(self, index: int, running: bool) -> None:
         slot = self.server_slots[index]
+        if not running:
+            self._slot_expected_backend.pop(index, None)
+            self._slot_in_device_info_block.discard(index)
+            self._slot_seen_accel_device.discard(index)
+            self._slot_cuda_fallback_warned.discard(index)
         self.server_running_states[index] = running
         slot.start_button.setEnabled(not running)
         slot.stop_button.setEnabled(running)
@@ -5600,10 +6027,11 @@ class MainWindow(QMainWindow):
         # do a real exit.  Otherwise minimize to tray.
         any_running = any(
             slot.process.state() != QProcess.NotRunning for slot in self.server_slots
-        )
+        ) or self.ollama_proxy.is_running() or self.sakura_monitor_api.is_running()
         if getattr(self, "_really_quit", False) or not any_running:
             self.tray_icon.hide()
             self.stop_ollama_proxy()
+            self.stop_sakura_monitor_api()
             self._save_config()
             self.sakura_timer.stop()
             self.sakura_monitor.shutdown()
