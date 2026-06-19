@@ -1202,12 +1202,12 @@ class OllamaCompatProxy:
             def do_GET(self) -> None:  # noqa: N802
                 parsed = urlparse(self.path)
                 if parsed.path == "/api/tags":
-                    payload = parent._build_tags_payload()
+                    payload = self._build_tags_payload_from_snapshot()
                     self._send_json(200, payload)
                     return
                 if parsed.path == "/v1/models":
                     # OpenAI-compatible models endpoint
-                    payload = parent._build_tags_payload()
+                    payload = self._build_tags_payload_from_snapshot()
                     # Convert to OpenAI format
                     models = []
                     for model in payload.get("models", []):
@@ -1220,6 +1220,37 @@ class OllamaCompatProxy:
                     self._send_json(200, {"object": "list", "data": models})
                     return
                 self._send_json(404, {"error": f"Unsupported endpoint: {parsed.path}"})
+
+            def _build_tags_payload_from_snapshot(self) -> dict[str, Any]:
+                snapshot = parent._get_snapshot()
+                models: list[dict[str, Any]] = []
+                for slot in snapshot.get("slots", []):
+                    model_name = str(slot.get("ollama_model", "")).strip()
+                    if not model_name:
+                        continue
+                    model_path = str(slot.get("model_path", "")).strip()
+                    size_bytes = 0
+                    if model_path and Path(model_path).exists():
+                        try:
+                            size_bytes = int(Path(model_path).stat().st_size)
+                        except OSError:
+                            size_bytes = 0
+                    models.append(
+                        {
+                            "name": model_name,
+                            "model": model_name,
+                            "modified_at": datetime.utcnow().isoformat() + "Z",
+                            "size": size_bytes,
+                            "digest": "",
+                            "details": {
+                                "format": "gguf",
+                                "family": "llama.cpp",
+                                "parameter_size": "",
+                                "quantization_level": "",
+                            },
+                        }
+                    )
+                return {"models": models}
 
             def do_POST(self) -> None:  # noqa: N802
                 parsed = urlparse(self.path)
@@ -2167,6 +2198,19 @@ class SakuraMonitorStatusServer:
         handler._send_json(200, response_chunk)  # type: ignore[attr-defined]
 
 
+def _attach_proxy_runtime_methods() -> None:
+    """Attach proxy request handlers that are shared with the monitor server class."""
+    for name, member in SakuraMonitorStatusServer.__dict__.items():
+        if not callable(member):
+            continue
+        if hasattr(OllamaCompatProxy, name):
+            continue
+        setattr(OllamaCompatProxy, name, member)
+
+
+_attach_proxy_runtime_methods()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2559,7 +2603,6 @@ class MainWindow(QMainWindow):
     def _parse_llama_server_device_output(self, output: str) -> list[GPUDevice]:
         devices: list[GPUDevice] = []
         seen_keys: set[str] = set()
-        seen_name_keys: set[str] = set()
 
         for line in output.splitlines():
             row = line.strip()
@@ -2579,8 +2622,7 @@ class MainWindow(QMainWindow):
             device_id = match.group(2).strip()
             label = match.group(3).strip()
             key = f"{backend}:{device_id}"
-            name_key = f"{backend}:{self._normalize_sakura_gpu_name(label)}"
-            if key in seen_keys or name_key in seen_name_keys:
+            if key in seen_keys:
                 continue
 
             devices.append(
@@ -2593,7 +2635,6 @@ class MainWindow(QMainWindow):
                 )
             )
             seen_keys.add(key)
-            seen_name_keys.add(name_key)
 
         return devices
 
@@ -3691,15 +3732,13 @@ class MainWindow(QMainWindow):
         self,
         devices: list[GPUDevice],
         seen_keys: set[str],
-        seen_name_keys: set[str],
         backend: str,
         gpu_id: str,
         gpu_name: str,
         device_name: str | None = None,
     ) -> None:
         key = f"{backend}:{gpu_id}"
-        name_key = f"{backend}:{self._normalize_sakura_gpu_name(gpu_name)}"
-        if key in seen_keys or name_key in seen_name_keys:
+        if key in seen_keys:
             return
 
         label_prefix = backend.upper() if backend != "vulkan" else "Vulkan"
@@ -3713,12 +3752,10 @@ class MainWindow(QMainWindow):
             )
         )
         seen_keys.add(key)
-        seen_name_keys.add(name_key)
 
     def _detect_available_devices(self) -> list[GPUDevice]:
         devices: list[GPUDevice] = [GPUDevice(key="cpu", label="CPU", backend="cpu", env_id="", device_name="CPU")]
         seen_keys = {"cpu"}
-        seen_name_keys: set[str] = set()
 
         nvidia_output = self._run_probe_command([
             "nvidia-smi",
@@ -3734,7 +3771,7 @@ class MainWindow(QMainWindow):
                 continue
             gpu_id = parts[0]
             gpu_name = parts[1] if len(parts) > 1 else f"NVIDIA GPU {gpu_id}"
-            self._append_detected_device(devices, seen_keys, seen_name_keys, "cuda", gpu_id, gpu_name)
+            self._append_detected_device(devices, seen_keys, "cuda", gpu_id, gpu_name)
 
         hip_devices = self._probe_llama_server_devices("hip")
         if hip_devices:
@@ -3742,7 +3779,6 @@ class MainWindow(QMainWindow):
                 self._append_detected_device(
                     devices,
                     seen_keys,
-                    seen_name_keys,
                     device.backend,
                     device.env_id,
                     device.label.split(":", 1)[1].strip() if ":" in device.label else device.label,
@@ -3756,7 +3792,7 @@ class MainWindow(QMainWindow):
                     continue
                 gpu_id = match.group(1)
                 gpu_name = match.group(2).strip()
-                self._append_detected_device(devices, seen_keys, seen_name_keys, "hip", gpu_id, gpu_name)
+                self._append_detected_device(devices, seen_keys, "hip", gpu_id, gpu_name)
 
         vulkan_devices = self._probe_llama_server_devices("vulkan")
         if vulkan_devices:
@@ -3764,7 +3800,6 @@ class MainWindow(QMainWindow):
                 self._append_detected_device(
                     devices,
                     seen_keys,
-                    seen_name_keys,
                     device.backend,
                     device.env_id,
                     device.label.split(":", 1)[1].strip() if ":" in device.label else device.label,
@@ -3778,19 +3813,20 @@ class MainWindow(QMainWindow):
                     continue
                 gpu_id = match.group(1)
                 gpu_name = match.group(2).strip()
-                self._append_detected_device(devices, seen_keys, seen_name_keys, "vulkan", gpu_id, gpu_name)
+                self._append_detected_device(devices, seen_keys, "vulkan", gpu_id, gpu_name)
 
             if os.name == "nt":
                 for gpu_name in self._probe_windows_video_controllers():
                     backend = self._backend_from_gpu_name(gpu_name)
                     if backend is None:
                         continue
+                    if any(device.backend == backend for device in devices):
+                        # Keep Windows video-controller probing as a fallback only.
+                        # If a backend was already detected from native probes,
+                        # avoid adding synthetic duplicate entries.
+                        continue
                     backend_count = sum(1 for device in devices if device.backend == backend)
-                    self._append_detected_device(devices, seen_keys, seen_name_keys, backend, str(backend_count), gpu_name)
-
-        if any(device.backend == "vulkan" for device in devices):
-            # Vulkan is the stable path on this setup; keep GPU selection Vulkan-only.
-            devices = [device for device in devices if device.backend in {"cpu", "vulkan"}]
+                    self._append_detected_device(devices, seen_keys, backend, str(backend_count), gpu_name)
 
         return devices
 
@@ -3832,15 +3868,6 @@ class MainWindow(QMainWindow):
             if preferred in available_vulkan_keys:
                 return preferred
             return available_vulkan_keys[0] if available_vulkan_keys else preferred
-
-        # If Vulkan GPUs are present, force all accelerator keys to Vulkan.
-        if available_vulkan_keys and ":" in device_key:
-            prefix, suffix = device_key.split(":", 1)
-            if prefix in {"cuda", "hip", "rocm", "vulkan"}:
-                preferred = f"vulkan:{suffix}"
-                if preferred in available_vulkan_keys:
-                    return preferred
-                return available_vulkan_keys[0]
 
         return device_key
 
