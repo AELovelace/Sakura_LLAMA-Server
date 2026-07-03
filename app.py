@@ -5276,6 +5276,9 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def _auto_start_servers(self) -> None:
         """Start any slots marked 'Auto-Start' and the proxy if needed."""
+        self.log_output.appendPlainText("[AUTO] Starting Sakura monitor API …")
+        self.start_sakura_monitor_api()
+
         started_any = False
         for slot in self.server_slots:
             if slot.auto_start_checkbox.isChecked():
