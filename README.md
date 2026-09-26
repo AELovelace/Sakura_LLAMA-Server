@@ -82,6 +82,8 @@ Routing behavior:
 - `model` (or `name`) is matched to a server slot by that slot's **Ollama Model** alias.
 - If no model is provided or no exact alias matches, requests route to the configured **Ollama default** server.
 
+`POST /v1/chat/completions` also passes `chat_template_kwargs`, `top_p`, `top_k`, `min_p`, `repeat_penalty`, `seed` and `stop` through to `llama-server` (e.g. `"chat_template_kwargs": {"enable_thinking": false}` for Qwen3).
+
 ## Sakura monitor API
 
 The app includes a lightweight GET endpoint for telemetry snapshots:

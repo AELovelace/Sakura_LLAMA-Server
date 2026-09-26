@@ -58,6 +58,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+# Extra llama-server sampling/template fields that /v1/chat/completions passes through upstream.
+CHAT_PASSTHROUGH_KEYS = ("chat_template_kwargs", "top_p", "top_k", "min_p", "repeat_penalty", "seed", "stop")
+
 try:
     import psutil
 except Exception:  # noqa: BLE001
@@ -1643,6 +1646,7 @@ class SakuraMonitorStatusServer:
         temperature: float,
         max_tokens: int,
         server_index: int | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         upstream_host = normalize_connect_host(str(slot.get("host", "127.0.0.1") or "127.0.0.1"))
         base_url = f"http://{upstream_host}:{int(slot.get('port', 8080))}"
@@ -1652,6 +1656,8 @@ class SakuraMonitorStatusServer:
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        if extra:
+            chat_payload.update(extra)
 
         chat_text: str | None = None
         chat_reasoning: str = ""
@@ -2045,15 +2051,19 @@ class SakuraMonitorStatusServer:
             self._send_error(handler, "No valid messages provided.", 400)
             return
 
-        temperature = float(payload.get("temperature", 0.7) or 0.7)
+        raw_temperature = payload.get("temperature")
+        temperature = float(raw_temperature) if raw_temperature is not None else 0.7
         max_tokens = int(payload.get("max_tokens", payload.get("max_completion_tokens", -1)) or -1)
         stream = bool(payload.get("stream", False))
+        extra = {key: payload[key] for key in CHAT_PASSTHROUGH_KEYS if key in payload}
 
         server_index = int(slot.get("index", 0) or 0)
         self._notify_request_start(server_index)
         try:
-            text, reasoning = self._forward_chat(slot, messages, temperature, max_tokens, server_index=server_index)
-        except requests.RequestException as exc:
+            text, reasoning = self._forward_chat(
+                slot, messages, temperature, max_tokens, server_index=server_index, extra=extra
+            )
+        except (requests.RequestException, RuntimeError) as exc:
             self._send_error(handler, f"Upstream llama-server request failed: {exc}", 502)
             return
         finally:
